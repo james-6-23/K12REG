@@ -74,6 +74,15 @@ func (r *RunManager) Snapshot() []string {
 	return out
 }
 
+// ClearLogs drops the in-memory log buffer so SSE replay stays empty after 清屏.
+func (r *RunManager) ClearLogs() int {
+	r.mu.Lock()
+	n := len(r.buf)
+	r.buf = nil
+	r.mu.Unlock()
+	return n
+}
+
 func (r *RunManager) Subscribe() chan string {
 	ch := make(chan string, 256)
 	r.mu.Lock()

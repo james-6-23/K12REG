@@ -116,6 +116,7 @@ func (s *Server) routes() {
 	s.mux.HandleFunc("/api/run/start", s.handleRunStart)
 	s.mux.HandleFunc("/api/run/stop", s.handleRunStop)
 	s.mux.HandleFunc("/api/run/logs/snapshot", s.handleLogsSnapshot)
+	s.mux.HandleFunc("/api/run/logs/clear", s.handleLogsClear)
 	s.mux.HandleFunc("/api/run/logs", s.handleLogsSSE)
 	s.mux.HandleFunc("/api/accounts", s.handleAccounts)
 	s.mux.HandleFunc("/api/schedule", s.handleSchedule)
@@ -515,6 +516,18 @@ func (s *Server) handleLogsSnapshot(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	writeJSON(w, http.StatusOK, map[string]any{"lines": s.runner.Snapshot()})
+}
+
+func (s *Server) handleLogsClear(w http.ResponseWriter, r *http.Request) {
+	if !s.auth.require(w, r) {
+		return
+	}
+	if r.Method != http.MethodPost && r.Method != http.MethodDelete {
+		writeJSON(w, http.StatusMethodNotAllowed, map[string]string{"detail": "method not allowed"})
+		return
+	}
+	n := s.runner.ClearLogs()
+	writeJSON(w, http.StatusOK, map[string]any{"ok": true, "cleared": n})
 }
 
 func (s *Server) handleLogsSSE(w http.ResponseWriter, r *http.Request) {

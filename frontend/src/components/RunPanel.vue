@@ -53,7 +53,13 @@ function startLogStream() {
   }
 }
 
-function clearLog() {
+async function clearLog() {
+  try {
+    // Clear server buffer first; otherwise refresh / SSE reconnect replays old lines.
+    await apiJSON('/api/run/logs/clear', { method: 'POST' })
+  } catch (e) {
+    console.warn('clear server logs failed', e)
+  }
   if (logEl.value) logEl.value.innerHTML = ''
 }
 
