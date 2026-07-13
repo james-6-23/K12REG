@@ -10,6 +10,7 @@ import SettingsPanel from './components/SettingsPanel.vue'
 import AdvancedPanel from './components/AdvancedPanel.vue'
 import FilesPanel from './components/FilesPanel.vue'
 import MailPoolPanel from './components/MailPoolPanel.vue'
+import TasksPanel from './components/TasksPanel.vue'
 import ResultsPanel from './components/ResultsPanel.vue'
 import SchedulePanel from './components/SchedulePanel.vue'
 import ToastHost from './components/ToastHost.vue'
@@ -23,6 +24,7 @@ const tabs: TabItem[] = [
   { id: 'settings', label: '设置' },
   { id: 'files', label: '数据文件' },
   { id: 'mail', label: '邮箱池' },
+  { id: 'tasks', label: '任务记录' },
   { id: 'results', label: '结果' },
   { id: 'schedule', label: '定时' },
   { id: 'advanced', label: '高级' },
@@ -33,6 +35,7 @@ const pageMeta: Record<TabId, { title: string; desc: string }> = {
   settings: { title: '设置', desc: '注册、Workspace、代理与导入 API' },
   files: { title: '数据文件', desc: '上传、编辑邮箱池 / 代理 / session' },
   mail: { title: '邮箱池', desc: '主号 / 别名已用与剩余可用槽位' },
+  tasks: { title: '任务记录', desc: '手动 / 定时运行历史与注册成功失败统计' },
   results: { title: '结果', desc: '已注册账号与下载产物' },
   schedule: { title: '定时任务', desc: '按间隔或每天固定时间自动启动流水线' },
   advanced: { title: '高级', desc: '直接编辑 settings.json 覆盖层' },
@@ -45,6 +48,7 @@ const fillPage = computed(
     tab.value === 'run' ||
     tab.value === 'files' ||
     tab.value === 'mail' ||
+    tab.value === 'tasks' ||
     tab.value === 'results' ||
     tab.value === 'advanced',
 )
@@ -148,6 +152,7 @@ onBeforeUnmount(stopStatusTimer)
           <SettingsPanel v-else-if="tab === 'settings'" />
           <FilesPanel v-else-if="tab === 'files'" />
           <MailPoolPanel v-else-if="tab === 'mail'" />
+          <TasksPanel v-else-if="tab === 'tasks'" />
           <ResultsPanel v-else-if="tab === 'results'" />
           <SchedulePanel v-else-if="tab === 'schedule'" />
           <AdvancedPanel v-else-if="tab === 'advanced'" />

@@ -23,7 +23,7 @@ const maxEditorBytes = 512 * 1024
 
 var hiddenNames = map[string]bool{
 	".DS_Store": true, "settings.json": true, ".effective_config.toml": true,
-	"schedule.json": true,
+	"schedule.json": true, "task_history.jsonl": true,
 }
 
 // Options for the control panel server.
@@ -120,6 +120,7 @@ func (s *Server) routes() {
 	s.mux.HandleFunc("/api/accounts", s.handleAccounts)
 	s.mux.HandleFunc("/api/schedule", s.handleSchedule)
 	s.mux.HandleFunc("/api/mail/pool", s.handleMailPool)
+	s.mux.HandleFunc("/api/tasks", s.handleTasks)
 	s.mux.HandleFunc("/", s.handleStatic)
 }
 
@@ -445,11 +446,50 @@ func (s *Server) handleRunStart(w http.ResponseWriter, r *http.Request) {
 	if wsID != "" {
 		_ = persistWorkspaceSelected(s.opt.DataDir, wsID)
 	}
-	if err := s.runner.Start(count, wsID); err != nil {
+	if err := s.runner.Start(count, wsID, "manual"); err != nil {
 		writeJSON(w, http.StatusConflict, map[string]string{"detail": err.Error()})
 		return
 	}
 	writeJSON(w, http.StatusOK, s.runner.Status())
+}
+
+func (s *Server) handleTasks(w http.ResponseWriter, r *http.Request) {
+	if !s.auth.require(w, r) {
+		return
+	}
+	switch r.Method {
+	case http.MethodGet:
+		limit := 100
+		if v := r.URL.Query().Get("limit"); v != "" {
+			if n, err := strconv.Atoi(v); err == nil && n > 0 {
+				limit = n
+				if limit > 500 {
+					limit = 500
+				}
+			}
+		}
+		recs, err := loadTaskRecords(s.opt.DataDir, limit)
+		if err != nil {
+			writeJSON(w, http.StatusInternalServerError, map[string]string{"detail": err.Error()})
+			return
+		}
+		if recs == nil {
+			recs = []TaskRecord{}
+		}
+		writeJSON(w, http.StatusOK, map[string]any{
+			"tasks":   recs,
+			"summary": taskSummary(recs),
+			"file":    taskHistoryFile,
+		})
+	case http.MethodDelete:
+		if err := clearTaskRecords(s.opt.DataDir); err != nil {
+			writeJSON(w, http.StatusInternalServerError, map[string]string{"detail": err.Error()})
+			return
+		}
+		writeJSON(w, http.StatusOK, map[string]any{"ok": true})
+	default:
+		writeJSON(w, http.StatusMethodNotAllowed, map[string]string{"detail": "method not allowed"})
+	}
 }
 
 func (s *Server) handleRunStop(w http.ResponseWriter, r *http.Request) {

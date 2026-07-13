@@ -164,23 +164,46 @@ func (s *Scheduler) tick(now time.Time) {
 
 	s.runner.emit(fmt.Sprintf("⏰ 定时任务触发 · mode=%s", cfg.Mode))
 
+	var count *int
+	reqN := 0
+	if cfg.Count != nil && *cfg.Count > 0 {
+		c := *cfg.Count
+		count = &c
+		reqN = c
+	}
+
 	if cfg.SkipIfRunning {
 		st := s.runner.Status()
 		if running, _ := st["running"].(bool); running {
 			s.note(false, "跳过：流水线正在运行")
 			s.runner.emit("⏰ 定时任务跳过：流水线正在运行")
+			now := time.Now().UTC()
+			_ = appendTaskRecord(s.dataDir, TaskRecord{
+				ID:         newTaskID(now),
+				Source:     "schedule",
+				Status:     "skipped",
+				StartedAt:  now.Format(time.RFC3339),
+				FinishedAt: now.Format(time.RFC3339),
+				Requested:  reqN,
+				Note:       "流水线正在运行",
+			})
 			return
 		}
 	}
 
-	var count *int
-	if cfg.Count != nil && *cfg.Count > 0 {
-		c := *cfg.Count
-		count = &c
-	}
-	if err := s.runner.Start(count, ""); err != nil {
+	if err := s.runner.Start(count, "", "schedule"); err != nil {
 		s.note(false, err.Error())
 		s.runner.emit("⏰ 定时启动失败: " + err.Error())
+		now := time.Now().UTC()
+		_ = appendTaskRecord(s.dataDir, TaskRecord{
+			ID:         newTaskID(now),
+			Source:     "schedule",
+			Status:     "error",
+			StartedAt:  now.Format(time.RFC3339),
+			FinishedAt: now.Format(time.RFC3339),
+			Requested:  reqN,
+			Note:       err.Error(),
+		})
 		return
 	}
 	s.note(true, "已启动")

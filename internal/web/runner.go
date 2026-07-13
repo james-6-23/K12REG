@@ -26,6 +26,10 @@ type RunManager struct {
 	buf       []string
 	maxBuf    int
 	subs      map[chan string]struct{}
+	// current run metadata (for task history)
+	runSource   string // manual | schedule
+	runCount    *int
+	runWSID     string
 }
 
 func NewRunManager(dataDir string) *RunManager {
@@ -113,7 +117,8 @@ func (r *RunManager) emit(line string) {
 // Start launches the pipeline.
 // count overrides settings total when non-nil.
 // workspaceID overrides workspace.selected_id when non-empty (and is used for join).
-func (r *RunManager) Start(count *int, workspaceID string) error {
+// source is "manual" or "schedule" (task history).
+func (r *RunManager) Start(count *int, workspaceID string, source string) error {
 	r.mu.Lock()
 	if r.running {
 		r.mu.Unlock()
@@ -125,22 +130,55 @@ func (r *RunManager) Start(count *int, workspaceID string) error {
 	r.startedAt = time.Now()
 	r.exitCode = nil
 	r.buf = nil
+	src := strings.TrimSpace(source)
+	if src == "" {
+		src = "manual"
+	}
+	r.runSource = src
+	r.runCount = count
+	r.runWSID = strings.TrimSpace(workspaceID)
 	r.mu.Unlock()
 
-	r.emit("▶ 启动流水线 (Go in-process)")
-	go r.run(ctx, count, strings.TrimSpace(workspaceID))
+	label := "手动"
+	if src == "schedule" {
+		label = "定时"
+	}
+	r.emit(fmt.Sprintf("▶ 启动流水线 (%s · Go in-process)", label))
+	go r.run(ctx, count, strings.TrimSpace(workspaceID), src)
 	return nil
 }
 
-func (r *RunManager) run(ctx context.Context, count *int, workspaceID string) {
+func (r *RunManager) run(ctx context.Context, count *int, workspaceID, source string) {
 	code := 0
+	started := time.Now()
+	rec := TaskRecord{
+		ID:        newTaskID(started),
+		Source:    source,
+		StartedAt: started.UTC().Format(time.RFC3339),
+		Status:    "error",
+	}
+	if source == "" {
+		rec.Source = "manual"
+	}
+
 	defer func() {
+		finished := time.Now()
+		rec.FinishedAt = finished.UTC().Format(time.RFC3339)
+		rec.ElapsedSec = finished.Sub(started).Seconds()
+		rec.ExitCode = code
+		if rec.Status == "" {
+			rec.Status = "error"
+		}
+		if err := appendTaskRecord(r.dataDir, rec); err != nil {
+			r.emit("· task history save: " + err.Error())
+		}
 		r.mu.Lock()
 		r.running = false
 		r.cancel = nil
 		r.exitCode = &code
 		r.mu.Unlock()
-		r.emit(fmt.Sprintf("■ 流水线结束 (exit=%d)", code))
+		r.emit(fmt.Sprintf("■ 流水线结束 (exit=%d · reg=%d fail=%d · %s)",
+			code, rec.Registered, rec.Fail, rec.Status))
 	}()
 
 	settingsPath := filepath.Join(r.dataDir, "settings.json")
@@ -152,6 +190,8 @@ func (r *RunManager) run(ctx context.Context, count *int, workspaceID string) {
 	if count != nil && *count > 0 {
 		cfg.Total = *count
 	}
+	rec.Requested = cfg.Total
+	rec.Threads = cfg.Threads
 	if workspaceID != "" {
 		cfg.WorkspaceSelectedID = workspaceID
 		// Keep selected in the pool for display consistency.
@@ -166,6 +206,7 @@ func (r *RunManager) run(ctx context.Context, count *int, workspaceID string) {
 			cfg.WorkspaceIDs = append([]string{workspaceID}, cfg.WorkspaceIDs...)
 		}
 	}
+	rec.WorkspaceID = cfg.ActiveWorkspaceID()
 	if cfg.SentinelVMDir == "" {
 		cfg.SentinelVMDir = os.Getenv("K12_SENTINEL_VM")
 	}
@@ -193,13 +234,18 @@ func (r *RunManager) run(ctx context.Context, count *int, workspaceID string) {
 	if cfg.MailboxesFile == "" {
 		r.emit("✗ mail pool: 未配置邮箱池文件（设置里选择，或上传任意 .txt 邮箱池）")
 		code = 1
+		rec.Status = "error"
+		rec.Note = "未配置邮箱池文件"
 		return
 	}
+	rec.MailboxesFile = cfg.MailboxesFile
 	r.emit(fmt.Sprintf("· mailboxes_file=%s", cfg.MailboxesFile))
 	pool, err := mail.LoadPool(mailFile, filepath.Join(r.dataDir, "outlook_token_state.json"), cfg.AliasCount)
 	if err != nil {
 		r.emit("✗ mail pool: " + err.Error())
 		code = 1
+		rec.Status = "error"
+		rec.Note = err.Error()
 		return
 	}
 
@@ -227,20 +273,42 @@ func (r *RunManager) run(ctx context.Context, count *int, workspaceID string) {
 		Ctx:     ctx,
 		Log:     func(s string) { r.emit(s) },
 	})
+	rec.Registered = st.Registered
+	rec.Fail = st.Fail
+	rec.JoinOK = st.JoinOK
+	rec.ApproveOK = st.ApproveOK
+	rec.K12 = st.K12
+	rec.ImportOK = st.ImportOK
 	if err != nil {
 		if ctx.Err() != nil {
 			r.emit("⏹ 已取消")
 			code = 130
+			rec.Status = "cancelled"
+			rec.Note = "用户停止 / 取消"
 			return
 		}
 		r.emit("✗ pipeline: " + err.Error())
 		code = 1
+		rec.Status = "error"
+		rec.Note = err.Error()
 		return
 	}
 	r.emit(fmt.Sprintf("── summary registered=%d join=%d k12=%d fail=%d",
 		st.Registered, st.JoinOK, st.K12, st.Fail))
 	if st.Registered == 0 && st.Fail > 0 {
 		code = 2
+		rec.Status = "fail"
+		rec.Note = "全部失败"
+		return
+	}
+	if st.Fail > 0 && st.Registered > 0 {
+		rec.Status = "ok"
+		rec.Note = "部分成功"
+		return
+	}
+	rec.Status = "ok"
+	if st.Registered == 0 && st.Fail == 0 {
+		rec.Note = "无任务完成"
 	}
 }
 

@@ -1,4 +1,47 @@
-export type TabId = 'run' | 'settings' | 'files' | 'mail' | 'results' | 'schedule' | 'advanced'
+export type TabId =
+  | 'run'
+  | 'settings'
+  | 'files'
+  | 'mail'
+  | 'tasks'
+  | 'results'
+  | 'schedule'
+  | 'advanced'
+
+export interface TaskRecord {
+  id: string
+  source: 'manual' | 'schedule' | string
+  status: 'ok' | 'fail' | 'cancelled' | 'error' | 'skipped' | string
+  started_at: string
+  finished_at: string
+  elapsed_sec: number
+  requested: number
+  registered: number
+  fail: number
+  join_ok: number
+  approve_ok: number
+  k12: number
+  import_ok: number
+  exit_code: number
+  workspace_id?: string
+  mailboxes_file?: string
+  threads?: number
+  note?: string
+}
+
+export interface TaskListResponse {
+  tasks: TaskRecord[]
+  summary: {
+    runs: number
+    runs_ok: number
+    runs_fail: number
+    runs_cancelled: number
+    total_registered: number
+    total_fail: number
+    total_elapsed_sec: number
+  }
+  file?: string
+}
 
 export interface MailPoolBaseRow {
   base_email: string
