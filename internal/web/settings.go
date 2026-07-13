@@ -1,0 +1,438 @@
+package web
+
+import (
+	"encoding/json"
+	"fmt"
+	"os"
+	"path/filepath"
+	"strings"
+)
+
+const settingsFile = "settings.json"
+
+// curated form shape returned by GET /api/settings
+func getEffectiveSettings(dataDir string) map[string]any {
+	ov := loadOverlay(dataDir)
+	// defaults matching Python form
+	out := map[string]any{
+		"import_api": map[string]any{
+			"require_k12": true,
+			"endpoints":   []any{},
+		},
+		"registration": map[string]any{
+			"total":         1,
+			"threads":       1,
+			"mode":          "protocol",
+			"pipeline_gate": "reg",
+		},
+		"workspace": map[string]any{
+			"enabled":              true,
+			"ids":                  []any{},
+			"selected_id":          "",
+			"manager_session_file": "session.json",
+			"approve_requests":     true,
+		},
+		"proxy": map[string]any{
+			"proxies_file":     "",
+			"default_protocol": "socks5",
+			"flaresolverr_url": "",
+		},
+		"mail": map[string]any{
+			"mailboxes_file": "",
+		},
+	}
+	deepMerge(out, extractCurated(ov))
+	// mailboxes_file may live under mail.providers[0]
+	if mail, ok := ov["mail"].(map[string]any); ok {
+		if mf, ok := mail["mailboxes_file"].(string); ok && mf != "" {
+			out["mail"].(map[string]any)["mailboxes_file"] = mf
+		}
+		if providers, ok := mail["providers"].([]any); ok && len(providers) > 0 {
+			if p0, ok := providers[0].(map[string]any); ok {
+				if mf, ok := p0["mailboxes_file"].(string); ok && mf != "" {
+					out["mail"].(map[string]any)["mailboxes_file"] = mf
+				}
+			}
+		}
+	}
+	return out
+}
+
+func extractCurated(ov map[string]any) map[string]any {
+	out := map[string]any{}
+	if m, ok := ov["import_api"].(map[string]any); ok {
+		out["import_api"] = normalizeImportAPI(m)
+	}
+	if m, ok := ov["registration"].(map[string]any); ok {
+		out["registration"] = map[string]any{
+			"total":         asInt(m["total"], 1),
+			"threads":       asInt(m["threads"], 1),
+			"mode":          orStr(asString(m["mode"]), "protocol"),
+			"pipeline_gate": orStr(asString(m["pipeline_gate"]), "reg"),
+		}
+	}
+	if m, ok := ov["workspace"].(map[string]any); ok {
+		ids := []any{}
+		if raw, ok := m["ids"].([]any); ok {
+			ids = raw
+		}
+		sel := asString(m["selected_id"])
+		if sel == "" {
+			sel = asString(m["id"])
+		}
+		if sel == "" && len(ids) > 0 {
+			if s, ok := ids[0].(string); ok {
+				sel = s
+			} else {
+				sel = strings.TrimSpace(fmt.Sprint(ids[0]))
+			}
+		}
+		out["workspace"] = map[string]any{
+			"enabled":              asBool(m["enabled"], true),
+			"ids":                  ids,
+			"selected_id":          sel,
+			"manager_session_file": orStr(asString(m["manager_session_file"]), "session.json"),
+			"approve_requests":     asBool(m["approve_requests"], true),
+		}
+	}
+	if m, ok := ov["proxy"].(map[string]any); ok {
+		out["proxy"] = map[string]any{
+			"proxies_file":     asString(m["proxies_file"]),
+			"default_protocol": orStr(asString(m["default_protocol"]), "socks5"),
+			"flaresolverr_url": asString(m["flaresolverr_url"]),
+		}
+	}
+	return out
+}
+
+func loadOverlay(dataDir string) map[string]any {
+	p := filepath.Join(dataDir, settingsFile)
+	b, err := os.ReadFile(p)
+	if err != nil {
+		return map[string]any{}
+	}
+	var m map[string]any
+	if json.Unmarshal(b, &m) != nil || m == nil {
+		return map[string]any{}
+	}
+	return m
+}
+
+func loadOverlayText(dataDir string) string {
+	p := filepath.Join(dataDir, settingsFile)
+	b, err := os.ReadFile(p)
+	if err != nil {
+		return "{}\n"
+	}
+	return string(b)
+}
+
+func saveOverlayText(dataDir, text string) error {
+	var m map[string]any
+	if err := json.Unmarshal([]byte(text), &m); err != nil {
+		return fmt.Errorf("JSON 解析失败: %w", err)
+	}
+	if m == nil {
+		return fmt.Errorf("根节点必须是 JSON 对象")
+	}
+	for k, v := range m {
+		if _, ok := v.(map[string]any); !ok {
+			return fmt.Errorf("节点 [%s] 必须是对象", k)
+		}
+	}
+	return writeOverlay(dataDir, m)
+}
+
+func saveOverlayForm(dataDir string, incoming map[string]any) (map[string]any, error) {
+	clean := sanitizeForm(incoming)
+	cur := loadOverlay(dataDir)
+	deepMerge(cur, clean)
+	// flatten mail.mailboxes_file into providers if needed
+	if mail, ok := clean["mail"].(map[string]any); ok {
+		if mf, ok := mail["mailboxes_file"].(string); ok {
+			m := cur["mail"]
+			if m == nil {
+				cur["mail"] = map[string]any{}
+				m = cur["mail"]
+			}
+			mm := m.(map[string]any)
+			mm["mailboxes_file"] = mf
+			providers, _ := mm["providers"].([]any)
+			if len(providers) == 0 {
+				providers = []any{map[string]any{"type": "outlook_token", "enable": true, "mode": "graph"}}
+			}
+			if p0, ok := providers[0].(map[string]any); ok {
+				p0["mailboxes_file"] = mf
+				providers[0] = p0
+			}
+			mm["providers"] = providers
+			cur["mail"] = mm
+		}
+	}
+	if err := writeOverlay(dataDir, cur); err != nil {
+		return nil, err
+	}
+	return cur, nil
+}
+
+func sanitizeForm(in map[string]any) map[string]any {
+	out := map[string]any{}
+	if m, ok := in["import_api"].(map[string]any); ok {
+		out["import_api"] = sanitizeImportAPI(m)
+	}
+	if m, ok := in["registration"].(map[string]any); ok {
+		out["registration"] = map[string]any{
+			"total":         asInt(m["total"], 1),
+			"threads":       asInt(m["threads"], 1),
+			"mode":          orStr(asString(m["mode"]), "protocol"),
+			"pipeline_gate": orStr(asString(m["pipeline_gate"]), "reg"),
+		}
+	}
+	if m, ok := in["workspace"].(map[string]any); ok {
+		ids := []any{}
+		switch t := m["ids"].(type) {
+		case []any:
+			for _, x := range t {
+				if s := strings.TrimSpace(fmt.Sprint(x)); s != "" && s != "<nil>" {
+					ids = append(ids, s)
+				}
+			}
+		}
+		sel := strings.TrimSpace(asString(m["selected_id"]))
+		if sel == "" {
+			sel = strings.TrimSpace(asString(m["id"]))
+		}
+		// Ensure selected is in the pool; default to first.
+		if sel != "" {
+			found := false
+			for _, x := range ids {
+				if strings.EqualFold(fmt.Sprint(x), sel) {
+					found = true
+					break
+				}
+			}
+			if !found {
+				ids = append([]any{sel}, ids...)
+			}
+		} else if len(ids) > 0 {
+			sel = fmt.Sprint(ids[0])
+		}
+		out["workspace"] = map[string]any{
+			"enabled":              asBool(m["enabled"], true),
+			"ids":                  ids,
+			"selected_id":          sel,
+			"manager_session_file": orStr(asString(m["manager_session_file"]), "session.json"),
+			"approve_requests":     asBool(m["approve_requests"], true),
+		}
+	}
+	if m, ok := in["proxy"].(map[string]any); ok {
+		out["proxy"] = map[string]any{
+			"proxies_file":     asString(m["proxies_file"]),
+			"default_protocol": orStr(asString(m["default_protocol"]), "socks5"),
+			"flaresolverr_url": asString(m["flaresolverr_url"]),
+		}
+	}
+	if m, ok := in["mail"].(map[string]any); ok {
+		out["mail"] = map[string]any{
+			"mailboxes_file": asString(m["mailboxes_file"]),
+		}
+	}
+	return out
+}
+
+// normalizeImportAPI converts legacy single-url shape into endpoints[].
+func normalizeImportAPI(m map[string]any) map[string]any {
+	reqK12 := asBool(m["require_k12"], true)
+	eps := []any{}
+	if raw, ok := m["endpoints"].([]any); ok && len(raw) > 0 {
+		for i, item := range raw {
+			em, ok := item.(map[string]any)
+			if !ok {
+				continue
+			}
+			name := asString(em["name"])
+			if name == "" {
+				name = fmt.Sprintf("api-%d", i+1)
+			}
+			eps = append(eps, map[string]any{
+				"name":        name,
+				"enabled":     asBool(em["enabled"], true),
+				"url":         asString(em["url"]),
+				"admin_key":   asString(em["admin_key"]),
+				"require_k12": asBool(em["require_k12"], reqK12),
+			})
+		}
+	} else if url := asString(m["url"]); url != "" {
+		// Legacy single import_api
+		eps = append(eps, map[string]any{
+			"name":        "default",
+			"enabled":     asBool(m["enabled"], true),
+			"url":         url,
+			"admin_key":   asString(m["admin_key"]),
+			"require_k12": reqK12,
+		})
+	}
+	return map[string]any{
+		"require_k12": reqK12,
+		"endpoints":   eps,
+	}
+}
+
+func sanitizeImportAPI(m map[string]any) map[string]any {
+	reqK12 := asBool(m["require_k12"], true)
+	eps := []any{}
+	if raw, ok := m["endpoints"].([]any); ok {
+		for i, item := range raw {
+			em, ok := item.(map[string]any)
+			if !ok {
+				continue
+			}
+			url := asString(em["url"])
+			if url == "" {
+				continue
+			}
+			name := asString(em["name"])
+			if name == "" {
+				name = fmt.Sprintf("api-%d", i+1)
+			}
+			eps = append(eps, map[string]any{
+				"name":        name,
+				"enabled":     asBool(em["enabled"], true),
+				"url":         url,
+				"admin_key":   asString(em["admin_key"]),
+				"require_k12": asBool(em["require_k12"], reqK12),
+			})
+		}
+	}
+	// Accept legacy fields on save as well
+	if len(eps) == 0 {
+		if url := asString(m["url"]); url != "" {
+			eps = append(eps, map[string]any{
+				"name":        "default",
+				"enabled":     asBool(m["enabled"], true),
+				"url":         url,
+				"admin_key":   asString(m["admin_key"]),
+				"require_k12": reqK12,
+			})
+		}
+	}
+	// Persist only multi shape (+ keep first as legacy fields for older tools)
+	out := map[string]any{
+		"require_k12": reqK12,
+		"endpoints":   eps,
+	}
+	if len(eps) > 0 {
+		if e0, ok := eps[0].(map[string]any); ok {
+			out["enabled"] = asBool(e0["enabled"], true)
+			out["url"] = asString(e0["url"])
+			out["admin_key"] = asString(e0["admin_key"])
+		}
+	} else {
+		out["enabled"] = false
+		out["url"] = ""
+		out["admin_key"] = ""
+	}
+	return out
+}
+
+func writeOverlay(dataDir string, m map[string]any) error {
+	if err := os.MkdirAll(dataDir, 0o755); err != nil {
+		return err
+	}
+	b, err := json.MarshalIndent(m, "", "  ")
+	if err != nil {
+		return err
+	}
+	b = append(b, '\n')
+	return os.WriteFile(filepath.Join(dataDir, settingsFile), b, 0o644)
+}
+
+// persistWorkspaceSelected updates workspace.selected_id (and ensures it is in ids).
+func persistWorkspaceSelected(dataDir, selectedID string) error {
+	selectedID = strings.TrimSpace(selectedID)
+	if selectedID == "" {
+		return nil
+	}
+	cur := loadOverlay(dataDir)
+	ws, _ := cur["workspace"].(map[string]any)
+	if ws == nil {
+		ws = map[string]any{}
+	}
+	ids := []any{}
+	if raw, ok := ws["ids"].([]any); ok {
+		ids = raw
+	}
+	found := false
+	for _, x := range ids {
+		if strings.EqualFold(strings.TrimSpace(fmt.Sprint(x)), selectedID) {
+			found = true
+			break
+		}
+	}
+	if !found {
+		ids = append([]any{selectedID}, ids...)
+	}
+	ws["ids"] = ids
+	ws["selected_id"] = selectedID
+	cur["workspace"] = ws
+	return writeOverlay(dataDir, cur)
+}
+
+func deepMerge(dst, src map[string]any) {
+	for k, v := range src {
+		if vm, ok := v.(map[string]any); ok {
+			if dm, ok := dst[k].(map[string]any); ok {
+				deepMerge(dm, vm)
+				continue
+			}
+			// copy map
+			cp := map[string]any{}
+			deepMerge(cp, vm)
+			dst[k] = cp
+			continue
+		}
+		dst[k] = v
+	}
+}
+
+func asString(v any) string {
+	if v == nil {
+		return ""
+	}
+	s, _ := v.(string)
+	return strings.TrimSpace(s)
+}
+
+func asBool(v any, def bool) bool {
+	switch t := v.(type) {
+	case bool:
+		return t
+	case string:
+		s := strings.ToLower(strings.TrimSpace(t))
+		return s == "1" || s == "true" || s == "yes" || s == "on"
+	default:
+		return def
+	}
+}
+
+func asInt(v any, def int) int {
+	switch t := v.(type) {
+	case float64:
+		return int(t)
+	case int:
+		return t
+	case json.Number:
+		i, err := t.Int64()
+		if err == nil {
+			return int(i)
+		}
+	}
+	return def
+}
+
+func orStr(s, def string) string {
+	if s == "" {
+		return def
+	}
+	return s
+}

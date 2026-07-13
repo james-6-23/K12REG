@@ -1,29 +1,18 @@
-# Python
-__pycache__/
-*.pyc
-.venv/
-venv/
-*.egg-info/
-build/
-dist/
-
-# Local data / secrets — should live in the mounted volume, not the image
-data/
-*.log
-registered_accounts.json
-access_token.txt
-sub2api*.json
-outlook.txt
-outlook1.txt
-outlook_used.txt
-hotmail.txt
-proxies.txt
-session.json
-hotsession.json
-
-# Misc
 .git/
 .gitignore
 .DS_Store
 .idea/
 .vscode/
+
+frontend/node_modules/
+frontend/dist/
+
+data/
+*.log
+registered_accounts.json
+access_token.txt
+outlook*.txt
+hotmail.txt
+proxies.txt
+*session*.json
+/k12reg

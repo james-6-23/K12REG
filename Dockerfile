@@ -1,39 +1,41 @@
 # syntax=docker/dockerfile:1
 
-# ── K12REG: ChatGPT 注册流水线 + Web 控制台 ──────────────────────────
-# 单容器：Python 流水线 + Node(Sentinel JSVMP) + FastAPI Web UI
-FROM python:3.12-slim
+# ── Stage 1: frontend ────────────────────────────────────────────────
+FROM node:22-bookworm-slim AS frontend
+WORKDIR /build/frontend
+COPY frontend/package.json frontend/package-lock.json ./
+RUN npm ci
+COPY frontend/ ./
+RUN npm run build
 
-# Node 供 Sentinel turnstile.dx JSVMP 执行（缺失时代码会退回纯 Python）
-# curl_cffi 需要 libssl / ca-certificates
+# ── Stage 2: Go ──────────────────────────────────────────────────────
+FROM golang:1.26-bookworm AS gobuild
+WORKDIR /src
+COPY go.mod go.sum ./
+RUN go mod download
+COPY cmd/ ./cmd/
+COPY internal/ ./internal/
+RUN CGO_ENABLED=0 go build -trimpath -ldflags="-s -w" -o /out/k12reg ./cmd/server
+
+# ── Stage 3: runtime ─────────────────────────────────────────────────
+FROM debian:bookworm-slim
 RUN apt-get update \
-    && apt-get install -y --no-install-recommends \
-        nodejs \
-        ca-certificates \
-        tini \
+    && apt-get install -y --no-install-recommends nodejs ca-certificates tini \
     && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /app
+COPY --from=gobuild /out/k12reg /usr/local/bin/k12reg
+COPY --from=frontend /build/frontend/dist /app/frontend/dist
+COPY scripts/sentinel_vm /app/scripts/sentinel_vm
 
-# 先装依赖以利用层缓存
-COPY pyproject.toml README.md ./
-RUN pip install --no-cache-dir \
-        "curl-cffi>=0.8.0" "rich>=13.0.0" \
-        "fastapi>=0.110.0" "uvicorn[standard]>=0.29.0" "python-multipart>=0.0.9"
-
-# 再拷贝源码
-COPY . .
-
-# 数据目录（挂载卷用）：config.toml / outlook.txt / proxies.txt / session.json / 输出
 ENV K12_DATA_DIR=/data \
     WEB_PASSWORD=admin \
     PORT=8000 \
-    PYTHONUNBUFFERED=1 \
-    NO_COLOR=1
-RUN mkdir -p /data
+    K12_STATIC_DIR=/app/frontend/dist \
+    K12_SENTINEL_VM=/app/scripts/sentinel_vm
 
+RUN mkdir -p /data
 EXPOSE 8000
 
-# tini 作 PID 1，正确转发信号（流水线子进程优雅停止）
 ENTRYPOINT ["tini", "--"]
-CMD ["sh", "-c", "uvicorn webapp.server:app --host 0.0.0.0 --port ${PORT}"]
+CMD ["sh", "-c", "exec k12reg serve -addr :${PORT} -data ${K12_DATA_DIR} -static ${K12_STATIC_DIR}"]

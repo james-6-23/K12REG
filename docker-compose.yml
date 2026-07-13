@@ -5,10 +5,10 @@ services:
     container_name: k12reg
     restart: unless-stopped
     ports:
-      - "8000:8000"
+      - "8989:8000"
     environment:
       # ★ 修改为你自己的访问密码
-      WEB_PASSWORD: "change-me"
+      WEB_PASSWORD: "test8989"
       PORT: "8000"
       K12_DATA_DIR: "/data"
     volumes:

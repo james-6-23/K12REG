@@ -1,42 +1,27 @@
-# ── Python ───────────────────────────────────────────────────────────
-__pycache__/
-*.py[cod]
-*.egg-info/
-.venv/
-venv/
-.venv-web/
-build/
-dist/
-.pytest_cache/
+# Go
+/k12reg
+/*.exe
 
-# ── 密钥 / 敏感运行数据（严禁提交）─────────────────────────────────────
-# 真实配置含 admin_key / 账号池地址 —— 用 config.toml.example 作模板
-config.toml
+# Frontend build
+frontend/node_modules/
+frontend/dist/
 
-# 邮箱池（含密码 / refresh_token）
-outlook.txt
+# Runtime data & secrets
+data/
+*.log
+settings.json
+.effective_config.toml
 outlook*.txt
 hotmail.txt
 mailbox*.txt
-
-# 代理池（含账密）
 proxies.txt
-
-# 母号管理员 session（含 token）
-session.json
-hotsession.json
 *session*.json
-
-# 注册产物（含 access_token / refresh_token）
 registered_accounts.json
 access_token.txt
 sub2api*.json
+config.toml
 
-# 运行状态 / 数据目录
-data/
-*.log
-
-# ── 系统 / 编辑器 ──────────────────────────────────────────────────────
+# IDE / OS
 .DS_Store
 .idea/
 .vscode/
