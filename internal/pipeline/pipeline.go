@@ -244,7 +244,14 @@ func Run(opt Options) (stats Stats, err error) {
 						opt.log("%s import skip · %s · plan=%s", tag, label, plan)
 						continue
 					}
-					ir := importapi.Push(ep.URL, ep.AdminKey, reg.AccessToken, proxy)
+					// Import to own account-pool APIs should go direct (no reg proxy).
+					// Residential SOCKS often RST/EOF when tunneling to arbitrary hosts.
+					ir := importapi.Push(ep.URL, ep.AdminKey, reg.AccessToken, "")
+					if !ir.OK && isImportNetErr(ir.Error) {
+						// One retry after brief backoff (API/proxy blips).
+						time.Sleep(800 * time.Millisecond)
+						ir = importapi.Push(ep.URL, ep.AdminKey, reg.AccessToken, "")
+					}
 					entry := map[string]any{
 						"name": label, "url": ep.URL, "status": ir.Outcome, "ok": ir.OK,
 					}
@@ -347,6 +354,19 @@ func pickProxy(opt Options, proxyIx *atomic.Int64) string {
 		return opt.Proxies[int(i)%len(opt.Proxies)]
 	}
 	return opt.Config.Proxy
+}
+
+func isImportNetErr(msg string) bool {
+	s := strings.ToLower(msg)
+	for _, k := range []string{
+		"connection reset", "eof", "timeout", "broken pipe", "connection refused",
+		"i/o timeout", "tls", "handshake", "no such host", "network is unreachable",
+	} {
+		if strings.Contains(s, k) {
+			return true
+		}
+	}
+	return false
 }
 
 func isRetryableRegister(err error) bool {
