@@ -566,10 +566,11 @@ html.light .th {
 }
 .log-time {
   flex-shrink: 0;
-  width: 4.25rem;
+  width: 5.75rem; /* HH:MM:SS.mmm */
   color: var(--app-faint);
   font-size: 11px;
   font-variant-numeric: tabular-nums;
+  font-family: var(--font-mono);
   padding-top: 0.1rem;
 }
 .log-w {

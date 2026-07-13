@@ -96,8 +96,11 @@ func (r *RunManager) Unsubscribe(ch chan string) {
 }
 
 func (r *RunManager) emit(line string) {
+	// Stamp server local time at emit so UI timestamps follow real event order.
+	// Client-side Date() would collapse to one second when SSE replays the buffer.
+	stamped := time.Now().Format("15:04:05.000") + "\t" + line
 	r.mu.Lock()
-	r.buf = append(r.buf, line)
+	r.buf = append(r.buf, stamped)
 	if len(r.buf) > r.maxBuf {
 		r.buf = r.buf[len(r.buf)-r.maxBuf:]
 	}
@@ -108,7 +111,7 @@ func (r *RunManager) emit(line string) {
 	r.mu.Unlock()
 	for _, ch := range subs {
 		select {
-		case ch <- line:
+		case ch <- stamped:
 		default:
 		}
 	}

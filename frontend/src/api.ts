@@ -75,25 +75,44 @@ export function classifyLog(line: string): string {
   return 'log-info'
 }
 
+/** Strip server emit prefix `HH:MM:SS.mmm\\t` (see RunManager.emit). */
+function splitServerLog(line: string): { time: string | null; body: string } {
+  // 15:04:05.000\\tbody  or  15:04:05\\tbody
+  const m = line.match(/^(\d{2}:\d{2}:\d{2}(?:\.\d{1,3})?)\t(.*)$/s)
+  if (m) return { time: m[1], body: m[2] }
+  // Already-prefixed without tab (legacy paste)
+  const m2 = line.match(/^(\d{2}:\d{2}:\d{2}(?:\.\d{1,3})?)\s+(.*)$/s)
+  if (m2 && !line.startsWith('[')) return { time: m2[1], body: m2[2] }
+  return { time: null, body: line }
+}
+
 /** Build a structured log row DOM node for the console. */
 export function buildLogRow(line: string, at = new Date()): HTMLElement {
+  const { time: serverTime, body } = splitServerLog(line)
   const row = document.createElement('div')
-  const level = classifyLog(line)
+  const level = classifyLog(body)
   row.className = `log-row ${level}`
 
   const time = document.createElement('span')
   time.className = 'log-time'
-  time.textContent = at.toLocaleTimeString('zh-CN', {
-    hour: '2-digit',
-    minute: '2-digit',
-    second: '2-digit',
-    hour12: false,
-  })
+  // Prefer server stamp (true event time); fallback to client receive time.
+  if (serverTime) {
+    // Show HH:MM:SS.mmm when present so same-second lines still differ.
+    time.textContent = serverTime.length > 8 ? serverTime : serverTime
+    time.title = serverTime
+  } else {
+    time.textContent = at.toLocaleTimeString('zh-CN', {
+      hour: '2-digit',
+      minute: '2-digit',
+      second: '2-digit',
+      hour12: false,
+    })
+  }
   row.appendChild(time)
 
   // [n/m] worker tag
-  const m = line.match(/^(\[(\d+)\/(\d+)\])\s*(.*)$/s)
-  let rest = line
+  const m = body.match(/^(\[(\d+)\/(\d+)\])\s*(.*)$/s)
+  let rest = body
   if (m) {
     const badge = document.createElement('span')
     const n = parseInt(m[2], 10) || 0
