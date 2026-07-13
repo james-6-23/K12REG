@@ -1,0 +1,16 @@
+services:
+  k12reg:
+    build: .
+    image: k12reg:latest
+    container_name: k12reg
+    restart: unless-stopped
+    ports:
+      - "8000:8000"
+    environment:
+      # ★ 修改为你自己的访问密码
+      WEB_PASSWORD: "change-me"
+      PORT: "8000"
+      K12_DATA_DIR: "/data"
+    volumes:
+      # 持久化所有运行数据：config.toml / 邮箱池 / 代理 / session / 输出结果
+      - ./data:/data

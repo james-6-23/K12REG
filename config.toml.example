@@ -1,0 +1,75 @@
+# ============================================
+# 协议注册配置示例 (curl_cffi + Sentinel)
+# 复制为 config.toml 后填入你自己的值；config.toml 已被 .gitignore 排除。
+#   uv run chatgpt-register -n 3
+#   uv run chatgpt-register register -n 1
+# Web 控制台：登录后在「配置」页点「载入默认模板」也可生成。
+# ============================================
+
+[mail]
+request_timeout = 30
+wait_timeout = 45
+wait_interval = 1.5
+
+[[mail.providers]]
+type = "outlook_token"
+enable = true
+label = "Outlook Pool"
+mode = "graph"
+imap_host = "outlook.office365.com"
+message_limit = 10
+# 邮箱池文件：email----password----client_id----refresh_token（每行一个）
+mailboxes_file = "outlook.txt"
+graph_scope = "https://graph.microsoft.com/.default"
+alias_count = 5
+
+[proxy]
+# 单节点代理留空则用 proxies_file 轮换
+url = ""
+proxies_file = "proxies.txt"
+default_protocol = "socks5"
+# 过盾（可选）：FlareSolverr 地址
+flaresolverr_url = ""
+jsd_url = ""
+
+[registration]
+mode = "protocol"
+threads = 3
+total = 1
+allow_high_browser_concurrency = false
+# reg | full | full_success —— 何时开下一个账号
+pipeline_gate = "full"
+
+[workspace]
+enabled = true
+# ★ 填你自己的 K12 母号 workspace UUID
+ids = ["your-k12-workspace-uuid"]
+route = "request"
+max_retries = 3
+retry_backoff_ms = 5000
+approve_requests = true
+approve_max_attempts = 12
+# 母号管理员 session 文件（含 token，勿提交）
+manager_session_file = "session.json"
+elevate_timeout_s = 90
+elevate_max_passes = 2
+elevate_tls_retries = 2
+elevate_request_timeout = 20
+
+[sub2api]
+enabled = false
+output_file = "sub2api_bundle.json"
+
+[import_api]
+enabled = false
+# ★ 填你自己的账号池 admin API
+url = "http://127.0.0.1:2003"
+admin_key = "<admin_secret>"
+# 仅 plan_type == k12 才推送
+require_k12 = true
+
+[logging]
+level = "INFO"
+# board = 实时看板；lines = 经典流式明细（Web 控制台强制 lines）
+style = "lines"
+file = ""

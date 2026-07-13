@@ -1,0 +1,109 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>K12REG 控制台</title>
+  <link rel="stylesheet" href="/static/style.css" />
+</head>
+<body>
+  <!-- 登录页 -->
+  <div id="login" class="login-wrap hidden">
+    <form id="login-form" class="login-card">
+      <h1>K12REG 控制台</h1>
+      <p class="muted">ChatGPT 注册 → K12 加入 → 导出流水线</p>
+      <input type="password" id="password" placeholder="访问密码" autocomplete="current-password" />
+      <button type="submit">登录</button>
+      <div id="login-error" class="error"></div>
+    </form>
+  </div>
+
+  <!-- 主界面 -->
+  <div id="app" class="hidden">
+    <header class="topbar">
+      <div class="brand">K12REG 控制台</div>
+      <nav class="tabs">
+        <button data-tab="run" class="active">运行</button>
+        <button data-tab="config">配置</button>
+        <button data-tab="files">数据文件</button>
+        <button data-tab="results">结果</button>
+      </nav>
+      <div class="topbar-right">
+        <span id="run-badge" class="badge idle">空闲</span>
+        <span class="muted" id="data-dir"></span>
+        <button id="logout" class="ghost">退出</button>
+      </div>
+    </header>
+
+    <!-- 运行 -->
+    <section id="tab-run" class="tab active">
+      <div class="row">
+        <div class="controls">
+          <label>本次数量 (留空用配置里的 total)</label>
+          <input type="number" id="run-count" min="1" placeholder="config: total" />
+          <button id="btn-start" class="primary">▶ 启动</button>
+          <button id="btn-stop" class="danger" disabled>⏹ 停止</button>
+          <button id="btn-clear" class="ghost">清屏</button>
+          <span id="run-status" class="muted"></span>
+        </div>
+      </div>
+      <pre id="log" class="log"></pre>
+    </section>
+
+    <!-- 配置 -->
+    <section id="tab-config" class="tab">
+      <div class="toolbar">
+        <button id="cfg-save" class="primary">保存 config.toml</button>
+        <button id="cfg-default" class="ghost">载入默认模板</button>
+        <button id="cfg-reload" class="ghost">重新读取</button>
+        <span id="cfg-status" class="muted"></span>
+      </div>
+      <textarea id="config-text" spellcheck="false" placeholder="# config.toml"></textarea>
+    </section>
+
+    <!-- 数据文件 -->
+    <section id="tab-files" class="tab">
+      <div class="files-layout">
+        <div class="files-list">
+          <div class="toolbar">
+            <button id="files-refresh" class="ghost">刷新</button>
+            <label class="upload-btn">
+              上传<input type="file" id="upload-input" hidden />
+            </label>
+          </div>
+          <p class="muted small">上传时以原文件名保存到数据目录。常用：<code>outlook.txt</code> / <code>hotmail.txt</code> / <code>proxies.txt</code> / <code>session.json</code> / <code>hotsession.json</code></p>
+          <table id="files-table">
+            <thead><tr><th>文件</th><th>大小</th><th></th></tr></thead>
+            <tbody></tbody>
+          </table>
+        </div>
+        <div class="files-editor">
+          <div class="toolbar">
+            <span id="edit-name" class="muted">未选择文件</span>
+            <button id="file-save" class="primary" disabled>保存</button>
+          </div>
+          <textarea id="file-text" spellcheck="false" placeholder="从左侧选择一个文本文件进行编辑"></textarea>
+        </div>
+      </div>
+    </section>
+
+    <!-- 结果 -->
+    <section id="tab-results" class="tab">
+      <div class="toolbar">
+        <button id="results-refresh" class="ghost">刷新</button>
+        <button id="dl-tokens" class="ghost">下载 access_token.txt</button>
+        <button id="dl-accounts" class="ghost">下载 registered_accounts.json</button>
+        <span id="results-summary" class="muted"></span>
+      </div>
+      <table id="accounts-table">
+        <thead><tr>
+          <th>邮箱</th><th>plan</th><th>join</th><th>approve</th><th>elevate</th><th>import</th><th>account_id</th><th>AT</th>
+        </tr></thead>
+        <tbody></tbody>
+      </table>
+    </section>
+  </div>
+
+  <script src="/static/app.js"></script>
+</body>
+</html>
