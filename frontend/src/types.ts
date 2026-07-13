@@ -51,6 +51,8 @@ export interface ProxySettings {
 
 export interface MailSettings {
   mailboxes_file: string
+  /** Plus-aliases per real mailbox (1 = no alias expansion). */
+  alias_count: number
 }
 
 export interface Settings {
@@ -107,7 +109,7 @@ export function defaultSettings(): Settings {
       approve_requests: true,
     },
     proxy: { proxies_file: '', default_protocol: 'socks5', flaresolverr_url: '' },
-    mail: { mailboxes_file: '' },
+    mail: { mailboxes_file: '', alias_count: 1 },
   }
 }
 

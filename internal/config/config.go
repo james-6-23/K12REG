@@ -152,6 +152,10 @@ func (c *Config) ApplyMap(raw map[string]any) {
 		if v, ok := m["mailboxes_file"].(string); ok && v != "" {
 			c.MailboxesFile = v
 		}
+		// Top-level mail.alias_count (settings form)
+		if v, ok := asInt(m["alias_count"]); ok && v > 0 {
+			c.AliasCount = v
+		}
 	}
 	if m, ok := raw["workspace"].(map[string]any); ok {
 		if v, ok := m["enabled"].(bool); ok {

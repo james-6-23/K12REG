@@ -89,6 +89,9 @@ async function loadSettings() {
     const s = await apiJSON<Settings>('/api/settings')
     s.registration.mode = 'protocol'
     s.import_api = normalizeImportApi(s.import_api)
+    if (!s.mail) s.mail = { mailboxes_file: '', alias_count: 1 }
+    if (!s.mail.alias_count || s.mail.alias_count < 1) s.mail.alias_count = 1
+    if (s.mail.alias_count > 50) s.mail.alias_count = 50
     if (!s.workspace.selected_id && s.workspace.ids?.length) {
       s.workspace.selected_id = s.workspace.ids[0]
     }
@@ -114,6 +117,10 @@ async function saveSettings() {
   }
   settings.value.registration.mode = 'protocol'
   settings.value.import_api = normalizeImportApi(settings.value.import_api)
+  let ac = Number(settings.value.mail.alias_count) || 1
+  if (ac < 1) ac = 1
+  if (ac > 50) ac = 50
+  settings.value.mail.alias_count = ac
   saving.value = true
   try {
     await apiJSON('/api/settings', {
@@ -266,6 +273,22 @@ onMounted(loadSettings)
             <p class="hint mt-1.5 leading-relaxed">
               任意文件名均可（如 1.txt / outlook.txt）。行格式：
               <span class="font-mono text-[10px] ui-muted">email----password----refresh----client_id</span>
+            </p>
+          </div>
+
+          <div>
+            <label class="label !mb-1">邮箱别名数量 alias_count</label>
+            <input
+              v-model.number="settings.mail.alias_count"
+              type="number"
+              min="1"
+              max="50"
+              class="field w-full !py-2"
+            />
+            <p class="hint mt-1.5 leading-relaxed">
+              1 = 不用别名；大于 1 时每个真实邮箱扩成多个
+              <span class="font-mono text-[10px] ui-muted">local+xxxxN@domain</span>
+              注册，OTP 仍进原邮箱。建议 1–5，过大易风控。
             </p>
           </div>
 

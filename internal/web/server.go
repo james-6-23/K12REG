@@ -87,7 +87,11 @@ func seedDataDir(dir string) {
 		_ = os.WriteFile(sp, []byte(`{
   "registration": { "mode": "protocol", "total": 1, "threads": 1, "pipeline_gate": "full" },
   "workspace": { "enabled": true, "ids": [], "selected_id": "", "manager_session_file": "hotsession.json", "approve_requests": true },
-  "mail": { "mailboxes_file": "hotmail.txt" },
+  "mail": {
+    "mailboxes_file": "hotmail.txt",
+    "alias_count": 1,
+    "providers": [{ "type": "outlook_token", "enable": true, "mode": "graph", "mailboxes_file": "hotmail.txt", "alias_count": 1 }]
+  },
   "proxy": { "proxies_file": "proxies.txt", "default_protocol": "socks5" },
   "import_api": { "require_k12": true, "endpoints": [] }
 }

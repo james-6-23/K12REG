@@ -39,21 +39,30 @@ func getEffectiveSettings(dataDir string) map[string]any {
 		},
 		"mail": map[string]any{
 			"mailboxes_file": "",
+			"alias_count":    1,
 		},
 	}
 	deepMerge(out, extractCurated(ov))
-	// mailboxes_file may live under mail.providers[0]
+	// mailboxes_file / alias_count may live under mail.providers[0]
 	if mail, ok := ov["mail"].(map[string]any); ok {
+		mm := out["mail"].(map[string]any)
 		if mf, ok := mail["mailboxes_file"].(string); ok && mf != "" {
-			out["mail"].(map[string]any)["mailboxes_file"] = mf
+			mm["mailboxes_file"] = mf
+		}
+		if ac, ok := asIntVal(mail["alias_count"]); ok && ac > 0 {
+			mm["alias_count"] = ac
 		}
 		if providers, ok := mail["providers"].([]any); ok && len(providers) > 0 {
 			if p0, ok := providers[0].(map[string]any); ok {
 				if mf, ok := p0["mailboxes_file"].(string); ok && mf != "" {
-					out["mail"].(map[string]any)["mailboxes_file"] = mf
+					mm["mailboxes_file"] = mf
+				}
+				if ac, ok := asIntVal(p0["alias_count"]); ok && ac > 0 {
+					mm["alias_count"] = ac
 				}
 			}
 		}
+		out["mail"] = mm
 	}
 	return out
 }
@@ -147,27 +156,41 @@ func saveOverlayForm(dataDir string, incoming map[string]any) (map[string]any, e
 	clean := sanitizeForm(incoming)
 	cur := loadOverlay(dataDir)
 	deepMerge(cur, clean)
-	// flatten mail.mailboxes_file into providers if needed
+	// flatten mail.mailboxes_file + alias_count into providers[0]
 	if mail, ok := clean["mail"].(map[string]any); ok {
-		if mf, ok := mail["mailboxes_file"].(string); ok {
-			m := cur["mail"]
-			if m == nil {
-				cur["mail"] = map[string]any{}
-				m = cur["mail"]
-			}
-			mm := m.(map[string]any)
-			mm["mailboxes_file"] = mf
-			providers, _ := mm["providers"].([]any)
-			if len(providers) == 0 {
-				providers = []any{map[string]any{"type": "outlook_token", "enable": true, "mode": "graph"}}
-			}
-			if p0, ok := providers[0].(map[string]any); ok {
-				p0["mailboxes_file"] = mf
-				providers[0] = p0
-			}
-			mm["providers"] = providers
-			cur["mail"] = mm
+		m := cur["mail"]
+		if m == nil {
+			cur["mail"] = map[string]any{}
+			m = cur["mail"]
 		}
+		mm := m.(map[string]any)
+		if mf, ok := mail["mailboxes_file"].(string); ok {
+			mm["mailboxes_file"] = mf
+		}
+		if ac, ok := asIntVal(mail["alias_count"]); ok {
+			if ac < 1 {
+				ac = 1
+			}
+			if ac > 50 {
+				ac = 50
+			}
+			mm["alias_count"] = ac
+		}
+		providers, _ := mm["providers"].([]any)
+		if len(providers) == 0 {
+			providers = []any{map[string]any{"type": "outlook_token", "enable": true, "mode": "graph"}}
+		}
+		if p0, ok := providers[0].(map[string]any); ok {
+			if mf, ok := mm["mailboxes_file"].(string); ok && mf != "" {
+				p0["mailboxes_file"] = mf
+			}
+			if ac, ok := asIntVal(mm["alias_count"]); ok && ac > 0 {
+				p0["alias_count"] = ac
+			}
+			providers[0] = p0
+		}
+		mm["providers"] = providers
+		cur["mail"] = mm
 	}
 	if err := writeOverlay(dataDir, cur); err != nil {
 		return nil, err
@@ -233,8 +256,16 @@ func sanitizeForm(in map[string]any) map[string]any {
 		}
 	}
 	if m, ok := in["mail"].(map[string]any); ok {
+		ac := asInt(m["alias_count"], 1)
+		if ac < 1 {
+			ac = 1
+		}
+		if ac > 50 {
+			ac = 50
+		}
 		out["mail"] = map[string]any{
 			"mailboxes_file": asString(m["mailboxes_file"]),
+			"alias_count":    ac,
 		}
 	}
 	return out
@@ -416,18 +447,35 @@ func asBool(v any, def bool) bool {
 }
 
 func asInt(v any, def int) int {
+	if n, ok := asIntVal(v); ok {
+		return n
+	}
+	return def
+}
+
+func asIntVal(v any) (int, bool) {
 	switch t := v.(type) {
 	case float64:
-		return int(t)
+		return int(t), true
 	case int:
-		return t
+		return t, true
+	case int64:
+		return int(t), true
 	case json.Number:
 		i, err := t.Int64()
 		if err == nil {
-			return int(i)
+			return int(i), true
 		}
+	case string:
+		s := strings.TrimSpace(t)
+		if s == "" {
+			return 0, false
+		}
+		var n int
+		_, err := fmt.Sscanf(s, "%d", &n)
+		return n, err == nil
 	}
-	return def
+	return 0, false
 }
 
 func orStr(s, def string) string {
