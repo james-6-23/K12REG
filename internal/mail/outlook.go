@@ -297,6 +297,76 @@ func (p *Pool) Release(mb Mailbox) {
 	}
 }
 
+// Base inbox lock: plus-aliases share one Graph mailbox; serialize sendOTP+wait
+// so concurrent workers do not steal each other's verification codes.
+var inboxOTPLocks sync.Map // baseEmail lower -> *sync.Mutex
+
+// claimedOTPCodes prevents two waiters from returning the same 6-digit code.
+var claimedOTPCodes sync.Map // code -> claimedAt
+
+// LockInboxOTP serializes OTP send/wait for a physical inbox (BaseEmail).
+// Call unlock when done (typically defer unlock()).
+func LockInboxOTP(mb Mailbox) (unlock func()) {
+	key := baseInboxKey(mb)
+	v, _ := inboxOTPLocks.LoadOrStore(key, &sync.Mutex{})
+	mu := v.(*sync.Mutex)
+	mu.Lock()
+	return mu.Unlock
+}
+
+func baseInboxKey(mb Mailbox) string {
+	b := strings.TrimSpace(mb.BaseEmail)
+	if b == "" {
+		b = mb.Address
+	}
+	// Collapse plus-alias to local@domain for safety.
+	local, domain, ok := strings.Cut(strings.ToLower(b), "@")
+	if ok {
+		local = strings.Split(local, "+")[0]
+		return local + "@" + domain
+	}
+	return strings.ToLower(b)
+}
+
+func claimOTPCode(code string) bool {
+	code = strings.TrimSpace(code)
+	if code == "" {
+		return false
+	}
+	now := time.Now()
+	// Drop codes older than 15 minutes.
+	claimedOTPCodes.Range(func(k, v any) bool {
+		if t, ok := v.(time.Time); ok && now.Sub(t) > 15*time.Minute {
+			claimedOTPCodes.Delete(k)
+		}
+		return true
+	})
+	_, loaded := claimedOTPCodes.LoadOrStore(code, now)
+	return !loaded
+}
+
+// UnclaimOTPCode releases a code if OpenAI rejected it (wrong/expired).
+func UnclaimOTPCode(code string) {
+	claimedOTPCodes.Delete(strings.TrimSpace(code))
+}
+
+var otpCodeRes = []*regexp.Regexp{
+	regexp.MustCompile(`(?is)background-color:\s*#F3F3F3[^>]*>[\s\S]*?(\d{6})[\s\S]*?</p>`),
+	regexp.MustCompile(`(?i)(?:Verification code|Your code is|code is|代码为|验证码)[:\s]*(\d{6})`),
+	regexp.MustCompile(`(?i)temporary\s+openai\s+verification\s+code[\s\S]{0,80}?(\d{6})`),
+	regexp.MustCompile(`(?i)>\s*(\d{6})\s*<`),
+}
+
+func extractOTPCode(m graphMsg) string {
+	blob := m.Subject + "\n" + m.Preview + "\n" + m.Body
+	for _, re := range otpCodeRes {
+		if sub := re.FindStringSubmatch(blob); len(sub) > 1 {
+			return sub[1]
+		}
+	}
+	return ""
+}
+
 // WaitForCode polls Graph for a 6-digit OpenAI OTP.
 // notBefore: only accept messages received at/after this time (set right after send-OTP).
 // onTick is optional progress callback: elapsed, timeout, note.
@@ -312,20 +382,18 @@ func WaitForCode(mb Mailbox, timeout, interval time.Duration, notBefore time.Tim
 	if interval <= 0 {
 		interval = 1500 * time.Millisecond
 	}
+	// Tight window: concurrent aliases must not pick older OTPs for other sessions.
 	if notBefore.IsZero() {
-		notBefore = start.Add(-15 * time.Second)
+		notBefore = start.Add(-3 * time.Second)
 	} else {
-		// small clock skew allowance
-		notBefore = notBefore.Add(-10 * time.Second)
+		notBefore = notBefore.Add(-3 * time.Second)
 	}
-	// Prefer explicit verification phrases; avoid bare 6-digit noise (dates, ids).
-	codeRes := []*regexp.Regexp{
-		regexp.MustCompile(`(?is)background-color:\s*#F3F3F3[^>]*>[\s\S]*?(\d{6})[\s\S]*?</p>`),
-		regexp.MustCompile(`(?i)(?:Verification code|Your code is|code is|代码为|验证码)[:\s]*(\d{6})`),
-		regexp.MustCompile(`(?i)>\s*(\d{6})\s*<`),
+	// Also ignore codes that arrived long before we started waiting (safety).
+	if notBefore.Before(start.Add(-30 * time.Second)) {
+		notBefore = start.Add(-30 * time.Second)
 	}
-	attempt := 0
 
+	attempt := 0
 	for time.Now().Before(deadline) {
 		attempt++
 		elapsed := time.Since(start)
@@ -334,29 +402,56 @@ func WaitForCode(mb Mailbox, timeout, interval time.Duration, notBefore time.Tim
 			if onTick != nil {
 				onTick(elapsed, timeout, fmt.Sprintf("graph err · try %d · %v", attempt, err))
 			}
-		} else {
-			candidates := 0
-			for _, m := range msgs {
-				if !m.Received.IsZero() && m.Received.Before(notBefore) {
-					continue
+			time.Sleep(interval)
+			continue
+		}
+
+		type cand struct {
+			code string
+			msg  graphMsg
+		}
+		var cands []cand
+		for _, m := range msgs {
+			if !m.Received.IsZero() && m.Received.Before(notBefore) {
+				continue
+			}
+			if !looksLikeOpenAIOTP(m) {
+				continue
+			}
+			code := extractOTPCode(m)
+			if code == "" {
+				continue
+			}
+			cands = append(cands, cand{code: code, msg: m})
+		}
+
+		// Newest first (Graph usually already desc, but re-sort to be sure).
+		for i := 0; i < len(cands); i++ {
+			for j := i + 1; j < len(cands); j++ {
+				ti, tj := cands[i].msg.Received, cands[j].msg.Received
+				if tj.After(ti) {
+					cands[i], cands[j] = cands[j], cands[i]
 				}
-				if !looksLikeOpenAIOTP(m) {
-					continue
-				}
-				candidates++
-				blob := m.Subject + "\n" + m.Preview + "\n" + m.Body
-				for _, re := range codeRes {
-					if sub := re.FindStringSubmatch(blob); len(sub) > 1 {
-						if onTick != nil {
-							onTick(elapsed, timeout, fmt.Sprintf("matched · %s", trunc(m.Subject, 40)))
-						}
-						return sub[1], nil
-					}
-				}
+			}
+		}
+
+		// Prefer unclaimed codes (other alias workers may have claimed older ones).
+		for _, c := range cands {
+			if !claimOTPCode(c.code) {
+				continue
 			}
 			if onTick != nil {
-				onTick(elapsed, timeout, fmt.Sprintf("inbox msgs=%d cand=%d", len(msgs), candidates))
+				age := ""
+				if !c.msg.Received.IsZero() {
+					age = fmt.Sprintf(" · age=%0.0fs", time.Since(c.msg.Received).Seconds())
+				}
+				onTick(elapsed, timeout, fmt.Sprintf("matched · %s%s", trunc(c.msg.Subject, 40), age))
 			}
+			return c.code, nil
+		}
+
+		if onTick != nil {
+			onTick(elapsed, timeout, fmt.Sprintf("inbox msgs=%d cand=%d unclaimed=0", len(msgs), len(cands)))
 		}
 		time.Sleep(interval)
 	}
@@ -446,7 +541,8 @@ func fetchGraph(client *httpx.Client, mb Mailbox) ([]graphMsg, error) {
 	}
 
 	q := url.Values{}
-	q.Set("$top", "10")
+	// Higher top when aliases share one inbox (many concurrent OTPs).
+	q.Set("$top", "25")
 	q.Set("$orderby", "receivedDateTime desc")
 	q.Set("$select", "subject,receivedDateTime,from,body,bodyPreview")
 	resp, err := client.Get(GraphMsgsURL+"?"+q.Encode(), map[string]string{

@@ -94,13 +94,16 @@ func Run(opt Options) (*Result, error) {
 		return nil, err
 	}
 
+	// Plus-aliases share one Graph inbox: hold base-inbox lock for send+wait so
+	// concurrent alias workers do not pick each other's codes.
+	unlockInbox := mail.LockInboxOTP(opt.Mailbox)
 	logf(opt, "send OTP")
-	otpSentAt := time.Now().UTC()
 	if err := sendOTP(client); err != nil {
+		unlockInbox()
 		return nil, err
 	}
 	// Boundary for inbox scan: only messages after we requested the code.
-	otpSentAt = time.Now().UTC()
+	otpSentAt := time.Now().UTC()
 
 	timeout := opt.OTPTimeout
 	if timeout <= 0 {
@@ -127,11 +130,14 @@ func Run(opt Options) (*Result, error) {
 		lastNote = note
 		logf(opt, "OTP · %0.0f/%0.0fs · %s", elapsed.Seconds(), total.Seconds(), note)
 	})
+	unlockInbox()
 	if err != nil {
 		return nil, err
 	}
 	logf(opt, "OTP · got %s · validate", code)
 	if err := validateOTP(client, code, deviceID, opt.SentinelVMDir); err != nil {
+		// Allow another waiter to try this code if OpenAI rejects it (rare).
+		mail.UnclaimOTPCode(code)
 		return nil, err
 	}
 
