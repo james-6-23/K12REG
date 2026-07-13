@@ -9,6 +9,7 @@ import RunPanel from './components/RunPanel.vue'
 import SettingsPanel from './components/SettingsPanel.vue'
 import AdvancedPanel from './components/AdvancedPanel.vue'
 import FilesPanel from './components/FilesPanel.vue'
+import MailPoolPanel from './components/MailPoolPanel.vue'
 import ResultsPanel from './components/ResultsPanel.vue'
 import SchedulePanel from './components/SchedulePanel.vue'
 import ToastHost from './components/ToastHost.vue'
@@ -21,6 +22,7 @@ const tabs: TabItem[] = [
   { id: 'run', label: '运行' },
   { id: 'settings', label: '设置' },
   { id: 'files', label: '数据文件' },
+  { id: 'mail', label: '邮箱池' },
   { id: 'results', label: '结果' },
   { id: 'schedule', label: '定时' },
   { id: 'advanced', label: '高级' },
@@ -30,6 +32,7 @@ const pageMeta: Record<TabId, { title: string; desc: string }> = {
   run: { title: '运行', desc: '启动 / 停止流水线，查看实时日志' },
   settings: { title: '设置', desc: '注册、Workspace、代理与导入 API' },
   files: { title: '数据文件', desc: '上传、编辑邮箱池 / 代理 / session' },
+  mail: { title: '邮箱池', desc: '主号 / 别名已用与剩余可用槽位' },
   results: { title: '结果', desc: '已注册账号与下载产物' },
   schedule: { title: '定时任务', desc: '按间隔或每天固定时间自动启动流水线' },
   advanced: { title: '高级', desc: '直接编辑 settings.json 覆盖层' },
@@ -37,7 +40,14 @@ const pageMeta: Record<TabId, { title: string; desc: string }> = {
 
 const meta = computed(() => pageMeta[tab.value])
 /** 需要铺满视口、内部自滚动的页面 */
-const fillPage = computed(() => tab.value === 'run' || tab.value === 'files' || tab.value === 'results' || tab.value === 'advanced')
+const fillPage = computed(
+  () =>
+    tab.value === 'run' ||
+    tab.value === 'files' ||
+    tab.value === 'mail' ||
+    tab.value === 'results' ||
+    tab.value === 'advanced',
+)
 
 let statusTimer: ReturnType<typeof setInterval> | null = null
 
@@ -137,6 +147,7 @@ onBeforeUnmount(stopStatusTimer)
           <RunPanel v-if="tab === 'run'" :run-status="runStatus" @refresh="refreshStatus" />
           <SettingsPanel v-else-if="tab === 'settings'" />
           <FilesPanel v-else-if="tab === 'files'" />
+          <MailPoolPanel v-else-if="tab === 'mail'" />
           <ResultsPanel v-else-if="tab === 'results'" />
           <SchedulePanel v-else-if="tab === 'schedule'" />
           <AdvancedPanel v-else-if="tab === 'advanced'" />

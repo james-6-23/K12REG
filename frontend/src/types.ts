@@ -1,4 +1,31 @@
-export type TabId = 'run' | 'settings' | 'files' | 'results' | 'schedule' | 'advanced'
+export type TabId = 'run' | 'settings' | 'files' | 'mail' | 'results' | 'schedule' | 'advanced'
+
+export interface MailPoolBaseRow {
+  base_email: string
+  alias_count: number
+  free: number
+  used: number
+  failed: number
+  token_invalid: number
+  in_use: number
+  status: 'free' | 'partial' | 'exhausted' | string
+  base_key_state: string
+}
+
+export interface MailPoolReport {
+  mailboxes_file: string
+  state_file: string
+  alias_count: number
+  base_total: number
+  slot_total: number
+  free: number
+  used: number
+  failed: number
+  token_invalid: number
+  in_use: number
+  bases: MailPoolBaseRow[]
+  error?: string
+}
 
 export interface TabItem {
   id: TabId
