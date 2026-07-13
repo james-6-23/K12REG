@@ -147,8 +147,15 @@ func Run(opt Options) (stats Stats, err error) {
 					opt.log("%s cancelled", tag)
 					return
 				}
-				opt.Pool.Mark(mb, false)
-				opt.log("%s REGISTER FAIL: %v", tag, regErr)
+				// Bad Graph refresh_token / compromised / already-used stock:
+				// mark base + aliases as used so they are not picked again.
+				if mail.IsGraphAuthPermanent(regErr) {
+					opt.Pool.MarkGraphDead(mb)
+					opt.log("%s REGISTER FAIL (graph dead · marked used): %v", tag, regErr)
+				} else {
+					opt.Pool.Mark(mb, false)
+					opt.log("%s REGISTER FAIL: %v", tag, regErr)
+				}
 				atomic.AddInt64(&stats.Fail, 1)
 				continue
 			}

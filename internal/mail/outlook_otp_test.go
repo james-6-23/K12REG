@@ -1,6 +1,7 @@
 package mail
 
 import (
+	"fmt"
 	"testing"
 	"time"
 )
@@ -65,6 +66,15 @@ func TestMessageOTPRefStable(t *testing.T) {
 	r2 := messageOTPRef(m2, "111111")
 	if r1 != r2 || r1 == "" {
 		t.Fatalf("fingerprint unstable: %q %q", r1, r2)
+	}
+}
+
+func TestIsGraphAuthPermanent(t *testing.T) {
+	if !IsGraphAuthPermanent(fmt.Errorf(`token refresh HTTP 400 scope="https://graph.microsoft.com/.default": AADSTS70000: Account security interrupt`)) {
+		t.Fatal("expected permanent for AADSTS70000")
+	}
+	if IsGraphAuthPermanent(fmt.Errorf("connection reset by peer")) {
+		t.Fatal("network blip is not permanent")
 	}
 }
 

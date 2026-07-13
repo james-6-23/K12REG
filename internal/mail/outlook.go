@@ -20,17 +20,15 @@ import (
 const (
 	TokenURL     = "https://login.microsoftonline.com/common/oauth2/v2.0/token"
 	GraphMsgsURL = "https://graph.microsoft.com/v1.0/me/messages"
-	// Reseller / sub-account pools typically only work with .default
-	// (returns Mail.ReadWrite). Mail.Read alone → AADSTS70000 invalid_grant.
+	// Reseller 子邮箱 (seller): only Graph .default — never Mail.Read.
+	// Cascading scopes multiplies failed login.microsoftonline.com hits and
+	// can trip AADSTS70000 "compromised" / security interrupt under concurrency.
 	GraphScopeDefault = "https://graph.microsoft.com/.default"
-	GraphScopeClassic = "offline_access https://graph.microsoft.com/Mail.Read"
 )
 
-// graphScopes tried in order until token exchange succeeds.
+// graphScopes: seller Graph only. Do not add Mail.Read / IMAP scopes here.
 var graphScopes = []string{
 	GraphScopeDefault,
-	"offline_access https://graph.microsoft.com/.default",
-	GraphScopeClassic,
 }
 
 // Mailbox is one Outlook pool entry (possibly a plus-alias).
@@ -65,17 +63,34 @@ func (p *Pool) Available() int {
 	defer p.mu.Unlock()
 	n := 0
 	for _, mb := range p.items {
-		key := strings.ToLower(mb.Address)
-		st := p.state[key]
-		if st == "used" || st == "failed" || st == "token_invalid" || st == "in_use" {
-			continue
-		}
-		if p.requireDomain != "" && emailDomain(mb.Address) != p.requireDomain {
+		if !p.entryUsableLocked(mb) {
 			continue
 		}
 		n++
 	}
 	return n
+}
+
+// entryUsableLocked: address free AND base not dead (used / token_invalid).
+func (p *Pool) entryUsableLocked(mb Mailbox) bool {
+	key := strings.ToLower(mb.Address)
+	st := p.state[key]
+	if st == "used" || st == "failed" || st == "token_invalid" || st == "in_use" {
+		return false
+	}
+	base := strings.ToLower(strings.TrimSpace(mb.BaseEmail))
+	if base == "" {
+		base = key
+	}
+	// Base consumed or Graph-dead → skip all plus-aliases of this inbox.
+	switch p.state[base] {
+	case "used", "token_invalid", "failed":
+		return false
+	}
+	if p.requireDomain != "" && emailDomain(mb.Address) != p.requireDomain {
+		return false
+	}
+	return true
 }
 
 func emailDomain(email string) string {
@@ -87,12 +102,27 @@ func emailDomain(email string) string {
 }
 
 // Graph access-token cache (per base refresh_token) — OTP polls every ~1.5s.
+// Singleflight + negative cache: concurrent aliases of one base share one exchange
+// (Python _cached_access_token), instead of N× scope attempts that trip AADSTS.
 type cachedAT struct {
 	token string
 	exp   time.Time
+	err   error // sticky permanent failure until exp
 }
 
-var graphTokenCache sync.Map // key clientID|rt → cachedAT
+var (
+	graphTokenCache sync.Map // key clientID|rt → cachedAT
+	graphTokenMu    sync.Map // key → *sync.Mutex singleflight
+)
+
+func tokenCacheKey(mb Mailbox) string {
+	return mb.ClientID + "|" + mb.RefreshToken
+}
+
+func tokenFlightMu(key string) *sync.Mutex {
+	v, _ := graphTokenMu.LoadOrStore(key, &sync.Mutex{})
+	return v.(*sync.Mutex)
+}
 
 type Credential struct {
 	Email        string
@@ -256,14 +286,10 @@ func (p *Pool) Acquire() (Mailbox, error) {
 	for i := 0; i < len(p.items); i++ {
 		idx := (p.index + i) % len(p.items)
 		mb := p.items[idx]
+		if !p.entryUsableLocked(mb) {
+			continue
+		}
 		key := strings.ToLower(mb.Address)
-		st := p.state[key]
-		if st == "used" || st == "failed" || st == "token_invalid" || st == "in_use" {
-			continue
-		}
-		if p.requireDomain != "" && emailDomain(mb.Address) != p.requireDomain {
-			continue
-		}
 		p.state[key] = "in_use"
 		p.index = idx + 1
 		p.saveState()
@@ -286,6 +312,65 @@ func (p *Pool) Mark(mb Mailbox, success bool) {
 		p.state[key] = "failed"
 	}
 	p.saveState()
+}
+
+// MarkGraphDead marks mailbox as used (consumed) when Graph token is permanently dead
+// (AADSTS70000 compromised / invalid_grant / etc.). Same base + same refresh_token
+// aliases are all marked used so the pool will not pick them again — treated like
+// "this mailbox stock was already burned / already used".
+func (p *Pool) MarkGraphDead(mb Mailbox) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	key := strings.ToLower(mb.Address)
+	base := strings.ToLower(strings.TrimSpace(mb.BaseEmail))
+	if base == "" {
+		base = key
+	}
+	mark := func(addr string) {
+		if addr == "" {
+			return
+		}
+		// Do not downgrade a successful used; force used for free/in_use/failed/token_invalid.
+		p.state[addr] = "used"
+	}
+	mark(key)
+	mark(base)
+	for _, item := range p.items {
+		addr := strings.ToLower(item.Address)
+		itemBase := strings.ToLower(strings.TrimSpace(item.BaseEmail))
+		if itemBase == "" {
+			itemBase = addr
+		}
+		sameBase := itemBase == base || addr == base || itemBase == key
+		sameRT := mb.RefreshToken != "" && item.RefreshToken == mb.RefreshToken
+		if sameBase || sameRT {
+			mark(addr)
+			mark(itemBase)
+		}
+	}
+	p.saveState()
+}
+
+// MarkTokenInvalid is kept as an alias of MarkGraphDead for clarity at call sites.
+func (p *Pool) MarkTokenInvalid(mb Mailbox) { p.MarkGraphDead(mb) }
+
+// IsGraphAuthPermanent reports token/account deaths that must not be retried.
+func IsGraphAuthPermanent(err error) bool {
+	if err == nil {
+		return false
+	}
+	es := strings.ToLower(err.Error())
+	for _, k := range []string{
+		"aadsts70000", "compromised", "aadsts50196", "request loop",
+		"aadsts70008", "aadsts700084", "invalid_grant", "token has been revoked",
+		"user account is found as compromised", "security interrupt",
+		"graph auth failed",
+	} {
+		if strings.Contains(es, k) {
+			return true
+		}
+	}
+	return false
 }
 
 func (p *Pool) Release(mb Mailbox) {
@@ -573,11 +658,34 @@ type graphMsg struct {
 }
 
 func exchangeAccessToken(client *httpx.Client, mb Mailbox) (string, error) {
-	cacheKey := mb.ClientID + "|" + mb.RefreshToken
+	cacheKey := tokenCacheKey(mb)
 	if v, ok := graphTokenCache.Load(cacheKey); ok {
 		c := v.(cachedAT)
-		if time.Now().Before(c.exp) && c.token != "" {
-			return c.token, nil
+		if time.Now().Before(c.exp) {
+			if c.token != "" {
+				return c.token, nil
+			}
+			if c.err != nil {
+				return "", c.err
+			}
+		}
+	}
+
+	// Singleflight: one refresh per (client_id, refresh_token) at a time.
+	mu := tokenFlightMu(cacheKey)
+	mu.Lock()
+	defer mu.Unlock()
+
+	// Re-check after wait (another alias may have filled cache).
+	if v, ok := graphTokenCache.Load(cacheKey); ok {
+		c := v.(cachedAT)
+		if time.Now().Before(c.exp) {
+			if c.token != "" {
+				return c.token, nil
+			}
+			if c.err != nil {
+				return "", c.err
+			}
 		}
 	}
 
@@ -608,10 +716,20 @@ func exchangeAccessToken(client *httpx.Client, mb Mailbox) (string, error) {
 			desc = httpx.DumpSnippet(tokResp.Body, 160)
 		}
 		lastErr = fmt.Errorf("token refresh HTTP %d scope=%q: %s", tokResp.StatusCode, scope, desc)
+		// Permanent account/token death: do not try more scopes (and never Mail.Read).
+		if IsGraphAuthPermanent(lastErr) {
+			break
+		}
 	}
 	if lastErr == nil {
 		lastErr = fmt.Errorf("token refresh failed")
 	}
+	// Negative cache so concurrent aliases don't hammer login.microsoftonline.com.
+	ttl := 2 * time.Minute
+	if IsGraphAuthPermanent(lastErr) {
+		ttl = 30 * time.Minute
+	}
+	graphTokenCache.Store(cacheKey, cachedAT{err: lastErr, exp: time.Now().Add(ttl)})
 	return "", lastErr
 }
 
