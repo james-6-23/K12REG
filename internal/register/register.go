@@ -2,6 +2,7 @@ package register
 
 import (
 	"bytes"
+	"context"
 	"crypto/rand"
 	"encoding/json"
 	"fmt"
@@ -56,6 +57,18 @@ type Options struct {
 	OTPInterval     time.Duration
 	SentinelVMDir   string
 	Log             func(string)
+	Ctx             context.Context
+}
+
+func (opt Options) ctx() context.Context {
+	if opt.Ctx != nil {
+		return opt.Ctx
+	}
+	return context.Background()
+}
+
+func (opt Options) errIfDone() error {
+	return opt.ctx().Err()
 }
 
 func logf(opt Options, format string, args ...any) {
@@ -66,11 +79,18 @@ func logf(opt Options, format string, args ...any) {
 
 // Run protocol registration for one mailbox.
 func Run(opt Options) (*Result, error) {
+	if err := opt.errIfDone(); err != nil {
+		return nil, err
+	}
 	client, err := httpx.New(opt.Proxy)
 	if err != nil {
 		return nil, err
 	}
 	defer client.Close()
+	// Stop button cancels ctx → close TLS session to abort hung OpenAI/Graph HTTP.
+	if stop := context.AfterFunc(opt.ctx(), func() { client.Close() }); stop != nil {
+		defer stop()
+	}
 
 	deviceID := randomUUID()
 	client.SetCookie("oai-did", deviceID, "auth.openai.com")
@@ -85,21 +105,28 @@ func Run(opt Options) (*Result, error) {
 	if err != nil {
 		return nil, err
 	}
+	if err := opt.errIfDone(); err != nil {
+		return nil, err
+	}
 	if err := platformAuthorize(client, email, deviceID, challenge); err != nil {
 		return nil, err
 	}
 
+	if err := opt.errIfDone(); err != nil {
+		return nil, err
+	}
 	logf(opt, "register user · %s %s", first, last)
 	if err := registerUser(client, email, password, deviceID, opt.SentinelVMDir); err != nil {
 		return nil, err
 	}
 
-	// Plus-aliases share one Graph inbox: hold base-inbox lock for send+wait so
-	// concurrent alias workers do not pick each other's codes.
-	unlockInbox := mail.LockInboxOTP(opt.Mailbox)
+	// Plus-aliases share one Graph inbox; WaitForCode filters by To/Cc (Python parity)
+	// so concurrent aliases of the same base can wait in parallel without inbox lock.
+	if err := opt.errIfDone(); err != nil {
+		return nil, err
+	}
 	logf(opt, "send OTP")
 	if err := sendOTP(client); err != nil {
-		unlockInbox()
 		return nil, err
 	}
 	// Boundary for inbox scan: only messages after we requested the code.
@@ -116,7 +143,7 @@ func Run(opt Options) (*Result, error) {
 	logf(opt, "OTP · waiting · timeout=%s", timeout)
 	var lastTick time.Time
 	var lastNote string
-	code, err := mail.WaitForCode(opt.Mailbox, timeout, interval, otpSentAt, func(elapsed, total time.Duration, note string) {
+	code, err := mail.WaitForCode(opt.ctx(), opt.Mailbox, timeout, interval, otpSentAt, func(elapsed, total time.Duration, note string) {
 		// Throttle noisy scan lines; always print matches / errors.
 		interesting := strings.Contains(note, "matched") || strings.Contains(note, "graph err")
 		now := time.Now()
@@ -130,8 +157,10 @@ func Run(opt Options) (*Result, error) {
 		lastNote = note
 		logf(opt, "OTP · %0.0f/%0.0fs · %s", elapsed.Seconds(), total.Seconds(), note)
 	})
-	unlockInbox()
 	if err != nil {
+		return nil, err
+	}
+	if err := opt.errIfDone(); err != nil {
 		return nil, err
 	}
 	logf(opt, "OTP · got %s · validate", code)
@@ -141,6 +170,9 @@ func Run(opt Options) (*Result, error) {
 		return nil, err
 	}
 
+	if err := opt.errIfDone(); err != nil {
+		return nil, err
+	}
 	fullName := first + " " + last
 	birth := randomBirthdate()
 	logf(opt, "create account · %s · dob %s", fullName, birth)
@@ -149,6 +181,9 @@ func Run(opt Options) (*Result, error) {
 		return nil, err
 	}
 
+	if err := opt.errIfDone(); err != nil {
+		return nil, err
+	}
 	logf(opt, "exchange tokens")
 	tokens, err := exchangeTokens(client, verifier, authCode)
 	if err != nil {

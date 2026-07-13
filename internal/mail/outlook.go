@@ -1,6 +1,7 @@
 package mail
 
 import (
+	"context"
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
@@ -297,57 +298,83 @@ func (p *Pool) Release(mb Mailbox) {
 	}
 }
 
-// Base inbox lock: plus-aliases share one Graph mailbox; serialize sendOTP+wait
-// so concurrent workers do not steal each other's verification codes.
-var inboxOTPLocks sync.Map // baseEmail lower -> *sync.Mutex
+// claimedOTPMsgs: message-ref → {code, at}. Aligns with Python's _seen_code_message_refs:
+// two alias waiters share one Graph inbox; each claims a distinct mail, not a bare 6-digit.
+var claimedOTPMsgs sync.Map // msgRef -> claimedOTPEntry
 
-// claimedOTPCodes prevents two waiters from returning the same 6-digit code.
-var claimedOTPCodes sync.Map // code -> claimedAt
-
-// LockInboxOTP serializes OTP send/wait for a physical inbox (BaseEmail).
-// Call unlock when done (typically defer unlock()).
-func LockInboxOTP(mb Mailbox) (unlock func()) {
-	key := baseInboxKey(mb)
-	v, _ := inboxOTPLocks.LoadOrStore(key, &sync.Mutex{})
-	mu := v.(*sync.Mutex)
-	mu.Lock()
-	return mu.Unlock
+type claimedOTPEntry struct {
+	Code string
+	At   time.Time
 }
 
-func baseInboxKey(mb Mailbox) string {
-	b := strings.TrimSpace(mb.BaseEmail)
-	if b == "" {
-		b = mb.Address
-	}
-	// Collapse plus-alias to local@domain for safety.
-	local, domain, ok := strings.Cut(strings.ToLower(b), "@")
-	if ok {
-		local = strings.Split(local, "+")[0]
-		return local + "@" + domain
-	}
-	return strings.ToLower(b)
-}
-
-func claimOTPCode(code string) bool {
-	code = strings.TrimSpace(code)
-	if code == "" {
-		return false
-	}
+func purgeStaleOTPClaims() {
 	now := time.Now()
-	// Drop codes older than 15 minutes.
-	claimedOTPCodes.Range(func(k, v any) bool {
-		if t, ok := v.(time.Time); ok && now.Sub(t) > 15*time.Minute {
-			claimedOTPCodes.Delete(k)
+	claimedOTPMsgs.Range(func(k, v any) bool {
+		if e, ok := v.(claimedOTPEntry); ok && now.Sub(e.At) > 15*time.Minute {
+			claimedOTPMsgs.Delete(k)
 		}
 		return true
 	})
-	_, loaded := claimedOTPCodes.LoadOrStore(code, now)
+}
+
+func claimOTPMessage(msgRef, code string) bool {
+	msgRef = strings.TrimSpace(msgRef)
+	code = strings.TrimSpace(code)
+	if msgRef == "" || code == "" {
+		return false
+	}
+	purgeStaleOTPClaims()
+	_, loaded := claimedOTPMsgs.LoadOrStore(msgRef, claimedOTPEntry{Code: code, At: time.Now()})
 	return !loaded
 }
 
-// UnclaimOTPCode releases a code if OpenAI rejected it (wrong/expired).
+// UnclaimOTPCode releases claims for a code if OpenAI rejected it (wrong/expired),
+// so another waiter (or retry) may try the same message again.
 func UnclaimOTPCode(code string) {
-	claimedOTPCodes.Delete(strings.TrimSpace(code))
+	code = strings.TrimSpace(code)
+	if code == "" {
+		return
+	}
+	claimedOTPMsgs.Range(func(k, v any) bool {
+		if e, ok := v.(claimedOTPEntry); ok && e.Code == code {
+			claimedOTPMsgs.Delete(k)
+		}
+		return true
+	})
+}
+
+// messageOTPRef uniquely identifies one Graph message for claim tracking.
+func messageOTPRef(m graphMsg, code string) string {
+	if m.ID != "" {
+		return "id:" + m.ID
+	}
+	// Fallback fingerprint when Graph omits id.
+	h := sha256.Sum256([]byte(strings.ToLower(m.Subject) + "|" + m.Received.UTC().Format(time.RFC3339Nano) + "|" + code + "|" + strings.Join(m.Recipients, ",")))
+	return "fp:" + hex.EncodeToString(h[:12])
+}
+
+// recipientMatchesMailbox mirrors Python _message_recipient_matches:
+// plus-aliases share one inbox; only accept mail addressed to this alias.
+// Empty recipient list → accept (some messages omit To) to avoid deadlock.
+func recipientMatchesMailbox(mb Mailbox, m graphMsg) bool {
+	address := strings.ToLower(strings.TrimSpace(mb.Address))
+	base := strings.ToLower(strings.TrimSpace(mb.BaseEmail))
+	if address == "" || address == base || (base == "" && !strings.Contains(address, "+")) {
+		return true // not an alias
+	}
+	local, _, _ := strings.Cut(address, "@")
+	tag := ""
+	if i := strings.Index(local, "+"); i >= 0 {
+		tag = local[i+1:]
+	}
+	if len(m.Recipients) == 0 {
+		return true
+	}
+	blob := strings.ToLower(strings.Join(m.Recipients, " "))
+	if strings.Contains(blob, address) {
+		return true
+	}
+	return tag != "" && strings.Contains(blob, "+"+tag)
 }
 
 var otpCodeRes = []*regexp.Regexp{
@@ -370,49 +397,77 @@ func extractOTPCode(m graphMsg) string {
 // WaitForCode polls Graph for a 6-digit OpenAI OTP.
 // notBefore: only accept messages received at/after this time (set right after send-OTP).
 // onTick is optional progress callback: elapsed, timeout, note.
-func WaitForCode(mb Mailbox, timeout, interval time.Duration, notBefore time.Time, onTick func(elapsed, total time.Duration, note string)) (string, error) {
+// ctx cancellation aborts quickly (between Graph polls / sleeps).
+func WaitForCode(ctx context.Context, mb Mailbox, timeout, interval time.Duration, notBefore time.Time, onTick func(elapsed, total time.Duration, note string)) (string, error) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
 	client, err := httpx.New("")
 	if err != nil {
 		return "", err
 	}
 	defer client.Close()
+	// Shorter per-request timeout so Stop doesn't wait up to 90s on a hung Graph call.
+	if client.Session != nil {
+		client.Session.SetTimeout(20 * time.Second)
+	}
+	// Abort in-flight Graph HTTP as soon as Stop cancels ctx.
+	if stop := context.AfterFunc(ctx, func() { client.Close() }); stop != nil {
+		defer stop()
+	}
 
-	start := time.Now()
+	start := time.Now().UTC()
 	deadline := start.Add(timeout)
 	if interval <= 0 {
 		interval = 1500 * time.Millisecond
 	}
-	// Tight window: concurrent aliases must not pick older OTPs for other sessions.
+	// Strict boundary (Python _code_not_before): only tiny skew for Graph clock vs local.
 	if notBefore.IsZero() {
-		notBefore = start.Add(-3 * time.Second)
+		notBefore = start
 	} else {
-		notBefore = notBefore.Add(-3 * time.Second)
+		notBefore = notBefore.UTC()
 	}
-	// Also ignore codes that arrived long before we started waiting (safety).
-	if notBefore.Before(start.Add(-30 * time.Second)) {
-		notBefore = start.Add(-30 * time.Second)
-	}
+	notBefore = notBefore.Add(-500 * time.Millisecond)
 
 	attempt := 0
 	for time.Now().Before(deadline) {
+		if err := ctx.Err(); err != nil {
+			return "", err
+		}
 		attempt++
 		elapsed := time.Since(start)
 		msgs, err := fetchGraph(client, mb)
 		if err != nil {
+			// Permanent Graph auth failures: fail fast (don't spam until OTP timeout).
+			es := strings.ToLower(err.Error())
+			if strings.Contains(es, "aadsts70000") || strings.Contains(es, "compromised") ||
+				strings.Contains(es, "aadsts50196") || strings.Contains(es, "request loop") {
+				return "", fmt.Errorf("graph auth failed: %w", err)
+			}
 			if onTick != nil {
 				onTick(elapsed, timeout, fmt.Sprintf("graph err · try %d · %v", attempt, err))
 			}
-			time.Sleep(interval)
+			if err := sleepCtx(ctx, interval); err != nil {
+				return "", err
+			}
 			continue
 		}
 
 		type cand struct {
 			code string
+			ref  string
 			msg  graphMsg
 		}
 		var cands []cand
+		skippedSibling := 0
 		for _, m := range msgs {
 			if !m.Received.IsZero() && m.Received.Before(notBefore) {
+				continue
+			}
+			if !recipientMatchesMailbox(mb, m) {
+				if looksLikeOpenAIOTP(m) {
+					skippedSibling++
+				}
 				continue
 			}
 			if !looksLikeOpenAIOTP(m) {
@@ -422,7 +477,8 @@ func WaitForCode(mb Mailbox, timeout, interval time.Duration, notBefore time.Tim
 			if code == "" {
 				continue
 			}
-			cands = append(cands, cand{code: code, msg: m})
+			ref := messageOTPRef(m, code)
+			cands = append(cands, cand{code: code, ref: ref, msg: m})
 		}
 
 		// Newest first (Graph usually already desc, but re-sort to be sure).
@@ -435,9 +491,9 @@ func WaitForCode(mb Mailbox, timeout, interval time.Duration, notBefore time.Tim
 			}
 		}
 
-		// Prefer unclaimed codes (other alias workers may have claimed older ones).
+		// Claim by message-ref so concurrent aliases each take their own mail.
 		for _, c := range cands {
-			if !claimOTPCode(c.code) {
+			if !claimOTPMessage(c.ref, c.code) {
 				continue
 			}
 			if onTick != nil {
@@ -451,11 +507,34 @@ func WaitForCode(mb Mailbox, timeout, interval time.Duration, notBefore time.Tim
 		}
 
 		if onTick != nil {
-			onTick(elapsed, timeout, fmt.Sprintf("inbox msgs=%d cand=%d unclaimed=0", len(msgs), len(cands)))
+			note := fmt.Sprintf("inbox msgs=%d cand=%d claimed", len(msgs), len(cands))
+			if skippedSibling > 0 {
+				note += fmt.Sprintf(" · skip_sibling=%d", skippedSibling)
+			}
+			onTick(elapsed, timeout, note)
 		}
-		time.Sleep(interval)
+		if err := sleepCtx(ctx, interval); err != nil {
+			return "", err
+		}
+	}
+	if err := ctx.Err(); err != nil {
+		return "", err
 	}
 	return "", fmt.Errorf("otp timeout after %s for %s", timeout, mb.Address)
+}
+
+func sleepCtx(ctx context.Context, d time.Duration) error {
+	if d <= 0 {
+		return ctx.Err()
+	}
+	t := time.NewTimer(d)
+	defer t.Stop()
+	select {
+	case <-ctx.Done():
+		return ctx.Err()
+	case <-t.C:
+		return nil
+	}
 }
 
 func looksLikeOpenAIOTP(m graphMsg) bool {
@@ -484,11 +563,13 @@ func trunc(s string, n int) string {
 }
 
 type graphMsg struct {
-	Subject  string
-	Body     string
-	Preview  string
-	From     string
-	Received time.Time
+	ID         string
+	Subject    string
+	Body       string
+	Preview    string
+	From       string
+	Recipients []string // to + cc addresses (lowercased)
+	Received   time.Time
 }
 
 func exchangeAccessToken(client *httpx.Client, mb Mailbox) (string, error) {
@@ -542,9 +623,10 @@ func fetchGraph(client *httpx.Client, mb Mailbox) ([]graphMsg, error) {
 
 	q := url.Values{}
 	// Higher top when aliases share one inbox (many concurrent OTPs).
-	q.Set("$top", "25")
+	q.Set("$top", "40")
 	q.Set("$orderby", "receivedDateTime desc")
-	q.Set("$select", "subject,receivedDateTime,from,body,bodyPreview")
+	// toRecipients/ccRecipients: required to disambiguate plus-aliases (Python parity).
+	q.Set("$select", "id,subject,receivedDateTime,from,toRecipients,ccRecipients,body,bodyPreview")
 	resp, err := client.Get(GraphMsgsURL+"?"+q.Encode(), map[string]string{
 		"Authorization": "Bearer " + at,
 		"Accept":        "application/json",
@@ -553,20 +635,24 @@ func fetchGraph(client *httpx.Client, mb Mailbox) ([]graphMsg, error) {
 	if err != nil {
 		return nil, err
 	}
+	type graphAddr struct {
+		EmailAddress struct {
+			Address string `json:"address"`
+		} `json:"emailAddress"`
+	}
 	var data struct {
 		Value []struct {
-			Subject           string `json:"subject"`
-			ReceivedDateTime  string `json:"receivedDateTime"`
-			BodyPreview       string `json:"bodyPreview"`
-			Body              struct {
+			ID               string `json:"id"`
+			Subject          string `json:"subject"`
+			ReceivedDateTime string `json:"receivedDateTime"`
+			BodyPreview      string `json:"bodyPreview"`
+			Body             struct {
 				ContentType string `json:"contentType"`
 				Content     string `json:"content"`
 			} `json:"body"`
-			From struct {
-				EmailAddress struct {
-					Address string `json:"address"`
-				} `json:"emailAddress"`
-			} `json:"from"`
+			From         graphAddr   `json:"from"`
+			ToRecipients []graphAddr `json:"toRecipients"`
+			CcRecipients []graphAddr `json:"ccRecipients"`
 		} `json:"value"`
 	}
 	if err := json.Unmarshal(resp.Body, &data); err != nil {
@@ -578,16 +664,25 @@ func fetchGraph(client *httpx.Client, mb Mailbox) ([]graphMsg, error) {
 		if t, err := time.Parse(time.RFC3339, it.ReceivedDateTime); err == nil {
 			rt = t
 		}
-		body := it.Body.Content
-		if strings.EqualFold(it.Body.ContentType, "html") && it.BodyPreview != "" {
-			// keep both
+		var rcpts []string
+		for _, r := range it.ToRecipients {
+			if a := strings.ToLower(strings.TrimSpace(r.EmailAddress.Address)); a != "" {
+				rcpts = append(rcpts, a)
+			}
+		}
+		for _, r := range it.CcRecipients {
+			if a := strings.ToLower(strings.TrimSpace(r.EmailAddress.Address)); a != "" {
+				rcpts = append(rcpts, a)
+			}
 		}
 		out = append(out, graphMsg{
-			Subject:  it.Subject,
-			Body:     body,
-			Preview:  it.BodyPreview,
-			From:     it.From.EmailAddress.Address,
-			Received: rt,
+			ID:         it.ID,
+			Subject:    it.Subject,
+			Body:       it.Body.Content,
+			Preview:    it.BodyPreview,
+			From:       it.From.EmailAddress.Address,
+			Recipients: rcpts,
+			Received:   rt,
 		})
 	}
 	return out, nil

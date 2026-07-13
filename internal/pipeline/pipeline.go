@@ -2,6 +2,7 @@ package pipeline
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"strings"
 	"sync"
@@ -136,10 +137,16 @@ func Run(opt Options) (stats Stats, err error) {
 
 			if ctx.Err() != nil {
 				opt.Pool.Release(mb)
+				opt.log("%s cancelled", tag)
 				return
 			}
-			reg, proxy, regErr := registerWithProxyRetry(opt, cfg, mb, tag, &proxyIx, proxyRetries)
+			reg, proxy, regErr := registerWithProxyRetry(ctx, opt, cfg, mb, tag, &proxyIx, proxyRetries)
 			if regErr != nil {
+				if errors.Is(regErr, context.Canceled) || errors.Is(regErr, context.DeadlineExceeded) {
+					opt.Pool.Release(mb)
+					opt.log("%s cancelled", tag)
+					return
+				}
 				opt.Pool.Mark(mb, false)
 				opt.log("%s REGISTER FAIL: %v", tag, regErr)
 				atomic.AddInt64(&stats.Fail, 1)
@@ -188,8 +195,10 @@ func Run(opt Options) (stats Stats, err error) {
 						opt.log("%s approve ok", tag)
 						acc["approve_status"] = "ok"
 						atomic.AddInt64(&stats.ApproveOK, 1)
-						// Brief wait for membership propagation.
-						time.Sleep(1500 * time.Millisecond)
+						// Brief wait for membership propagation (interruptible).
+						if err := sleepCtx(ctx, 1500*time.Millisecond); err != nil {
+							return
+						}
 					}
 				} else if hasMgr && cfg.ApproveRequests {
 					acc["approve_status"] = "skipped"
@@ -249,7 +258,9 @@ func Run(opt Options) (stats Stats, err error) {
 					ir := importapi.Push(ep.URL, ep.AdminKey, reg.AccessToken, "")
 					if !ir.OK && isImportNetErr(ir.Error) {
 						// One retry after brief backoff (API/proxy blips).
-						time.Sleep(800 * time.Millisecond)
+						if err := sleepCtx(ctx, 800*time.Millisecond); err != nil {
+							return
+						}
 						ir = importapi.Push(ep.URL, ep.AdminKey, reg.AccessToken, "")
 					}
 					entry := map[string]any{
@@ -308,10 +319,15 @@ func Run(opt Options) (stats Stats, err error) {
 		go worker()
 	}
 	wg.Wait()
+	// Surface cancel so RunManager can mark exit=130 instead of a normal summary.
+	if err := ctx.Err(); err != nil {
+		return stats, err
+	}
 	return stats, nil
 }
 
 func registerWithProxyRetry(
+	ctx context.Context,
 	opt Options,
 	cfg config.Config,
 	mb mail.Mailbox,
@@ -319,8 +335,14 @@ func registerWithProxyRetry(
 	proxyIx *atomic.Int64,
 	maxAttempts int,
 ) (*register.Result, string, error) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
 	var lastErr error
 	for attempt := 1; attempt <= maxAttempts; attempt++ {
+		if err := ctx.Err(); err != nil {
+			return nil, "", err
+		}
 		proxy := pickProxy(opt, proxyIx)
 		if attempt > 1 {
 			opt.log("%s register retry %d/%d · proxy=%s", tag, attempt, maxAttempts, maskProxy(proxy))
@@ -334,11 +356,19 @@ func registerWithProxyRetry(
 			OTPInterval:   time.Duration(cfg.WaitInterval * float64(time.Second)),
 			SentinelVMDir: cfg.SentinelVMDir,
 			Log:           func(s string) { opt.log("%s %s", tag, s) },
+			Ctx:           ctx,
 		})
 		if err == nil {
 			return reg, proxy, nil
 		}
 		lastErr = err
+		// Prefer ctx error when Stop closed the HTTP session mid-request.
+		if err := ctx.Err(); err != nil {
+			return nil, proxy, err
+		}
+		if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+			return nil, proxy, err
+		}
 		if !isRetryableRegister(err) || attempt == maxAttempts {
 			return nil, proxy, err
 		}
@@ -346,6 +376,20 @@ func registerWithProxyRetry(
 		opt.log("%s soft-fail · rotate proxy & re-authorize · %v", tag, err)
 	}
 	return nil, "", lastErr
+}
+
+func sleepCtx(ctx context.Context, d time.Duration) error {
+	if d <= 0 {
+		return ctx.Err()
+	}
+	t := time.NewTimer(d)
+	defer t.Stop()
+	select {
+	case <-ctx.Done():
+		return ctx.Err()
+	case <-t.C:
+		return nil
+	}
 }
 
 func pickProxy(opt Options, proxyIx *atomic.Int64) string {
