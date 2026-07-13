@@ -19,16 +19,22 @@ function isAccountsDump(name: string) {
 }
 
 const filtered = computed(() => {
+  const list = Array.isArray(files.value) ? files.value : []
   const q = query.value.trim().toLowerCase()
-  if (!q) return files.value
-  return files.value.filter((f) => f.name.toLowerCase().includes(q))
+  if (!q) return list
+  return list.filter((f) => f.name.toLowerCase().includes(q))
 })
 
 const commonHints = ['hotmail.txt', 'proxies.txt', 'hotsession.json']
 
 async function loadFiles() {
-  const data = await apiJSON<{ files: DataFile[] }>('/api/files')
-  files.value = data.files
+  try {
+    const data = await apiJSON<{ files: DataFile[] | null }>('/api/files')
+    files.value = Array.isArray(data.files) ? data.files : []
+  } catch (e) {
+    files.value = []
+    toastError((e as Error).message || '加载文件列表失败')
+  }
 }
 
 async function openFile(name: string) {
@@ -119,7 +125,7 @@ onMounted(loadFiles)
 
 <template>
   <section
-    class="animate-fade-in grid min-h-0 flex-1 gap-3 overflow-y-auto lg:grid-cols-[minmax(300px,360px)_1fr] lg:overflow-hidden"
+    class="animate-fade-in grid min-h-[50vh] flex-1 gap-3 overflow-y-auto lg:h-full lg:min-h-0 lg:grid-cols-[minmax(300px,360px)_1fr] lg:overflow-hidden"
   >
     <!-- File list -->
     <div class="card flex max-h-[46vh] min-h-[220px] flex-col !p-0 lg:max-h-none lg:min-h-0">

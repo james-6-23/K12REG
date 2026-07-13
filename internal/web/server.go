@@ -48,6 +48,7 @@ func New(opt Options) *Server {
 		opt.SessionDays = 30
 	}
 	_ = os.MkdirAll(opt.DataDir, 0o755)
+	seedDataDir(opt.DataDir)
 	runner := NewRunManager(opt.DataDir)
 	s := &Server{
 		opt:       opt,
@@ -58,6 +59,40 @@ func New(opt Options) *Server {
 	}
 	s.routes()
 	return s
+}
+
+// seedDataDir creates empty template files if missing so first deploy is usable.
+// No host-side mkdir is required: Docker volume mount + server MkdirAll handle the directory.
+func seedDataDir(dir string) {
+	_ = os.MkdirAll(dir, 0o755)
+	type seed struct {
+		name string
+		body string
+	}
+	for _, f := range []seed{
+		{name: "hotmail.txt", body: "# email----password----refresh_token----client_id\n"},
+		{name: "proxies.txt", body: "# host:port:user:pass  or  socks5://user:pass@host:port\n"},
+		{name: "hotsession.json", body: "{}\n"},
+		{name: "session.json", body: "{}\n"},
+	} {
+		p := filepath.Join(dir, f.name)
+		if _, err := os.Stat(p); err == nil {
+			continue
+		}
+		_ = os.WriteFile(p, []byte(f.body), 0o644)
+	}
+	// Minimal settings only if completely missing (never overwrite user config).
+	sp := filepath.Join(dir, settingsFile)
+	if _, err := os.Stat(sp); err != nil {
+		_ = os.WriteFile(sp, []byte(`{
+  "registration": { "mode": "protocol", "total": 1, "threads": 1, "pipeline_gate": "full" },
+  "workspace": { "enabled": true, "ids": [], "selected_id": "", "manager_session_file": "hotsession.json", "approve_requests": true },
+  "mail": { "mailboxes_file": "hotmail.txt" },
+  "proxy": { "proxies_file": "proxies.txt", "default_protocol": "socks5" },
+  "import_api": { "require_k12": true, "endpoints": [] }
+}
+`), 0o644)
+	}
 }
 
 func (s *Server) Handler() http.Handler { return s.mux }
@@ -186,11 +221,13 @@ func (s *Server) handleFiles(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) listFiles() []map[string]any {
+	// Always return a non-nil slice so JSON is [] not null (empty data dir / read error).
+	out := make([]map[string]any, 0)
+	_ = os.MkdirAll(s.opt.DataDir, 0o755)
 	entries, err := os.ReadDir(s.opt.DataDir)
 	if err != nil {
-		return nil
+		return out
 	}
-	var out []map[string]any
 	for _, e := range entries {
 		if e.IsDir() || hiddenNames[e.Name()] {
 			continue

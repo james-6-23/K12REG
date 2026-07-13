@@ -12,5 +12,6 @@ services:
       PORT: "8000"
       K12_DATA_DIR: "/data"
     volumes:
-      # 持久化所有运行数据：config.toml / 邮箱池 / 代理 / session / 输出结果
+      # Docker 会自动创建宿主机 ./data（无需手动 mkdir）
+      # 容器启动时会自动生成 hotmail.txt / proxies.txt / hotsession.json 等模板
       - ./data:/data

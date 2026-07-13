@@ -27,6 +27,9 @@ WORKDIR /app
 COPY --from=gobuild /out/k12reg /usr/local/bin/k12reg
 COPY --from=frontend /build/frontend/dist /app/frontend/dist
 COPY scripts/sentinel_vm /app/scripts/sentinel_vm
+COPY scripts/docker-entrypoint.sh /usr/local/bin/docker-entrypoint.sh
+RUN chmod +x /usr/local/bin/docker-entrypoint.sh \
+    && mkdir -p /data
 
 ENV K12_DATA_DIR=/data \
     WEB_PASSWORD=admin \
@@ -34,8 +37,7 @@ ENV K12_DATA_DIR=/data \
     K12_STATIC_DIR=/app/frontend/dist \
     K12_SENTINEL_VM=/app/scripts/sentinel_vm
 
-RUN mkdir -p /data
 EXPOSE 8000
 
-ENTRYPOINT ["tini", "--"]
-CMD ["sh", "-c", "exec k12reg serve -addr :${PORT} -data ${K12_DATA_DIR} -static ${K12_STATIC_DIR}"]
+# Entrypoint ensures $K12_DATA_DIR exists (works with empty named volumes / fresh bind mounts).
+ENTRYPOINT ["tini", "--", "docker-entrypoint.sh"]
