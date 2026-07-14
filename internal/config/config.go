@@ -74,7 +74,7 @@ func Default() Config {
 		Threads:              1,
 		MailboxesFile:        "hotmail.txt",
 		AliasCount:           1,
-		WaitTimeout:          90,
+		WaitTimeout:          30, // OTP wait (seconds); 30s is enough for Graph delivery
 		WaitInterval:         1.5,
 		WorkspaceEnabled:     true,
 		WorkspaceRoute:       "request",

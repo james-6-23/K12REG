@@ -134,7 +134,7 @@ func Run(opt Options) (*Result, error) {
 
 	timeout := opt.OTPTimeout
 	if timeout <= 0 {
-		timeout = 60 * time.Second
+		timeout = 30 * time.Second
 	}
 	interval := opt.OTPInterval
 	if interval <= 0 {

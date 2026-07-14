@@ -123,6 +123,10 @@ export interface MailSettings {
   mailboxes_file: string
   /** Plus-aliases per real mailbox (1 = no alias expansion). */
   alias_count: number
+  /** OTP wait timeout in seconds (default 30). */
+  wait_timeout: number
+  /** OTP inbox poll interval in seconds (default 1.5). */
+  wait_interval: number
 }
 
 export interface Settings {
@@ -179,7 +183,7 @@ export function defaultSettings(): Settings {
       approve_requests: true,
     },
     proxy: { proxies_file: '', default_protocol: 'socks5', flaresolverr_url: '' },
-    mail: { mailboxes_file: '', alias_count: 1 },
+    mail: { mailboxes_file: '', alias_count: 1, wait_timeout: 30, wait_interval: 1.5 },
   }
 }
 

@@ -89,9 +89,13 @@ async function loadSettings() {
     const s = await apiJSON<Settings>('/api/settings')
     s.registration.mode = 'protocol'
     s.import_api = normalizeImportApi(s.import_api)
-    if (!s.mail) s.mail = { mailboxes_file: '', alias_count: 1 }
+    if (!s.mail) s.mail = { mailboxes_file: '', alias_count: 1, wait_timeout: 30, wait_interval: 1.5 }
     if (!s.mail.alias_count || s.mail.alias_count < 1) s.mail.alias_count = 1
     if (s.mail.alias_count > 50) s.mail.alias_count = 50
+    if (!s.mail.wait_timeout || s.mail.wait_timeout < 5) s.mail.wait_timeout = 30
+    if (s.mail.wait_timeout > 300) s.mail.wait_timeout = 300
+    if (!s.mail.wait_interval || s.mail.wait_interval < 0.3) s.mail.wait_interval = 1.5
+    if (s.mail.wait_interval > 30) s.mail.wait_interval = 30
     if (!s.workspace.selected_id && s.workspace.ids?.length) {
       s.workspace.selected_id = s.workspace.ids[0]
     }
@@ -121,6 +125,14 @@ async function saveSettings() {
   if (ac < 1) ac = 1
   if (ac > 50) ac = 50
   settings.value.mail.alias_count = ac
+  let wt = Number(settings.value.mail.wait_timeout) || 30
+  if (wt < 5) wt = 5
+  if (wt > 300) wt = 300
+  settings.value.mail.wait_timeout = wt
+  let wi = Number(settings.value.mail.wait_interval) || 1.5
+  if (wi < 0.3) wi = 0.3
+  if (wi > 30) wi = 30
+  settings.value.mail.wait_interval = wi
   saving.value = true
   try {
     await apiJSON('/api/settings', {
@@ -290,6 +302,33 @@ onMounted(loadSettings)
               <span class="font-mono text-[10px] ui-muted">local+xxxxN@domain</span>
               注册，OTP 仍进原邮箱。建议 1–5，过大易风控。
             </p>
+          </div>
+
+          <div class="grid grid-cols-2 gap-2.5">
+            <div>
+              <label class="label !mb-1">OTP 超时（秒）</label>
+              <input
+                v-model.number="settings.mail.wait_timeout"
+                type="number"
+                min="5"
+                max="300"
+                step="1"
+                class="field w-full !py-2"
+              />
+              <p class="hint mt-1.5">等验证码最长时间，默认 30</p>
+            </div>
+            <div>
+              <label class="label !mb-1">轮询间隔（秒）</label>
+              <input
+                v-model.number="settings.mail.wait_interval"
+                type="number"
+                min="0.3"
+                max="30"
+                step="0.1"
+                class="field w-full !py-2"
+              />
+              <p class="hint mt-1.5">收件箱扫描间隔，默认 1.5</p>
+            </div>
           </div>
 
           <div class="relative z-[1] border-t pt-3" style="border-color: var(--app-border-soft)">

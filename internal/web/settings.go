@@ -40,6 +40,8 @@ func getEffectiveSettings(dataDir string) map[string]any {
 		"mail": map[string]any{
 			"mailboxes_file": "",
 			"alias_count":    1,
+			"wait_timeout":   30,
+			"wait_interval":  1.5,
 		},
 	}
 	deepMerge(out, extractCurated(ov))
@@ -51,6 +53,12 @@ func getEffectiveSettings(dataDir string) map[string]any {
 		}
 		if ac, ok := asIntVal(mail["alias_count"]); ok && ac > 0 {
 			mm["alias_count"] = ac
+		}
+		if wt, ok := asFloatVal(mail["wait_timeout"]); ok && wt > 0 {
+			mm["wait_timeout"] = wt
+		}
+		if wi, ok := asFloatVal(mail["wait_interval"]); ok && wi > 0 {
+			mm["wait_interval"] = wi
 		}
 		if providers, ok := mail["providers"].([]any); ok && len(providers) > 0 {
 			if p0, ok := providers[0].(map[string]any); ok {
@@ -156,7 +164,7 @@ func saveOverlayForm(dataDir string, incoming map[string]any) (map[string]any, e
 	clean := sanitizeForm(incoming)
 	cur := loadOverlay(dataDir)
 	deepMerge(cur, clean)
-	// flatten mail.mailboxes_file + alias_count into providers[0]
+	// flatten mail.mailboxes_file + alias_count + wait_* into providers[0]
 	if mail, ok := clean["mail"].(map[string]any); ok {
 		m := cur["mail"]
 		if m == nil {
@@ -175,6 +183,12 @@ func saveOverlayForm(dataDir string, incoming map[string]any) (map[string]any, e
 				ac = 50
 			}
 			mm["alias_count"] = ac
+		}
+		if wt, ok := asFloatVal(mail["wait_timeout"]); ok {
+			mm["wait_timeout"] = wt
+		}
+		if wi, ok := asFloatVal(mail["wait_interval"]); ok {
+			mm["wait_interval"] = wi
 		}
 		providers, _ := mm["providers"].([]any)
 		if len(providers) == 0 {
@@ -263,9 +277,31 @@ func sanitizeForm(in map[string]any) map[string]any {
 		if ac > 50 {
 			ac = 50
 		}
+		wt := 30.0
+		if v, ok := asFloatVal(m["wait_timeout"]); ok && v > 0 {
+			wt = v
+		}
+		if wt < 5 {
+			wt = 5
+		}
+		if wt > 300 {
+			wt = 300
+		}
+		wi := 1.5
+		if v, ok := asFloatVal(m["wait_interval"]); ok && v > 0 {
+			wi = v
+		}
+		if wi < 0.3 {
+			wi = 0.3
+		}
+		if wi > 30 {
+			wi = 30
+		}
 		out["mail"] = map[string]any{
 			"mailboxes_file": asString(m["mailboxes_file"]),
 			"alias_count":    ac,
+			"wait_timeout":   wt,
+			"wait_interval":  wi,
 		}
 	}
 	return out
@@ -474,6 +510,31 @@ func asIntVal(v any) (int, bool) {
 		var n int
 		_, err := fmt.Sscanf(s, "%d", &n)
 		return n, err == nil
+	}
+	return 0, false
+}
+
+func asFloatVal(v any) (float64, bool) {
+	switch t := v.(type) {
+	case float64:
+		return t, true
+	case float32:
+		return float64(t), true
+	case int:
+		return float64(t), true
+	case int64:
+		return float64(t), true
+	case json.Number:
+		f, err := t.Float64()
+		return f, err == nil
+	case string:
+		s := strings.TrimSpace(t)
+		if s == "" {
+			return 0, false
+		}
+		var f float64
+		_, err := fmt.Sscanf(s, "%f", &f)
+		return f, err == nil
 	}
 	return 0, false
 }
