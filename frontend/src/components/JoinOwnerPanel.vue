@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { computed, onMounted, ref, watch } from 'vue'
+import { computed, nextTick, onMounted, ref, watch } from 'vue'
 import { apiJSON } from '../api'
 import type { DataFile, Settings } from '../types'
 import FileSelect from './FileSelect.vue'
@@ -53,6 +53,7 @@ const savingSession = ref(false)
 const managerMeta = ref<SessionMeta | null>(null)
 const targetMeta = ref<SessionMeta | null>(null)
 const logs = ref<LogLine[]>([])
+const logBox = ref<HTMLElement | null>(null)
 const result = ref<JoinOwnerResult | null>(null)
 const saveHint = ref('可从数据目录选择母号 session 文件，或直接粘贴 JSON')
 const defaultMailboxesFile = ref('')
@@ -208,7 +209,20 @@ async function parseBoth() {
 
 function appendClientLog(level: string, msg: string) {
   logs.value = [...logs.value, { t: Date.now(), level, msg }]
+  scrollLogsToBottom()
 }
+
+function scrollLogsToBottom() {
+  nextTick(() => {
+    const el = logBox.value
+    if (el) el.scrollTop = el.scrollHeight
+  })
+}
+
+watch(
+  () => logs.value.length,
+  () => scrollLogsToBottom(),
+)
 
 async function runJoin() {
   const fileName = managerFile.value.trim()
@@ -290,17 +304,77 @@ async function runJoin() {
   }
 
   try {
-    // apiJSON throws on non-2xx; join may return 422 with body — use fetch
-    // 注册模式含 OTP，可能较久，不要设短超时
-    const res = await fetch('/api/workspace/join-owner', {
+    // SSE 流式日志（注册/OTP 可能很长，边跑边看）
+    const res = await fetch('/api/workspace/join-owner?stream=1', {
       method: 'POST',
       credentials: 'same-origin',
-      headers: { 'content-type': 'application/json' },
+      headers: {
+        'content-type': 'application/json',
+        accept: 'text/event-stream',
+      },
       body: JSON.stringify(body),
     })
-    const data = (await res.json()) as JoinOwnerResult
+    if (!res.ok && !res.headers.get('content-type')?.includes('text/event-stream')) {
+      // non-stream error JSON
+      const errBody = (await res.json().catch(() => ({}))) as { detail?: string; error?: string }
+      throw new Error(errBody.detail || errBody.error || `HTTP ${res.status}`)
+    }
+    if (!res.body) {
+      throw new Error('响应无 body，无法流式读日志')
+    }
+
+    const reader = res.body.getReader()
+    const decoder = new TextDecoder()
+    let buf = ''
+    let finalResult: JoinOwnerResult | null = null
+
+    const handleEvent = (event: string, dataStr: string) => {
+      let data: unknown
+      try {
+        data = JSON.parse(dataStr)
+      } catch {
+        return
+      }
+      if (event === 'log') {
+        const line = data as LogLine
+        if (line && typeof line.msg === 'string') {
+          logs.value = [...logs.value, line]
+          // watch(logs.length) will scroll
+        }
+        return
+      }
+      if (event === 'result' || event === 'error') {
+        finalResult = data as JoinOwnerResult
+      }
+    }
+
+    while (true) {
+      const { done, value } = await reader.read()
+      if (done) break
+      buf += decoder.decode(value, { stream: true })
+      // Parse SSE blocks separated by blank lines
+      for (;;) {
+        const sep = buf.indexOf('\n\n')
+        if (sep < 0) break
+        const block = buf.slice(0, sep)
+        buf = buf.slice(sep + 2)
+        let ev = 'message'
+        const dataLines: string[] = []
+        for (const rawLine of block.split('\n')) {
+          const line = rawLine.replace(/\r$/, '')
+          if (line.startsWith('event:')) ev = line.slice(6).trim()
+          else if (line.startsWith('data:')) dataLines.push(line.slice(5).trimStart())
+        }
+        if (dataLines.length) handleEvent(ev, dataLines.join('\n'))
+      }
+    }
+
+    if (!finalResult) {
+      throw new Error('流结束但未收到 result 事件')
+    }
+    const data = finalResult
     result.value = data
-    if (Array.isArray(data.logs)) {
+    if (Array.isArray(data.logs) && data.logs.length && logs.value.length < data.logs.length) {
       logs.value = data.logs
     }
     if (data.manager) {
@@ -323,7 +397,6 @@ async function runJoin() {
         has_access_token: true,
       }
     }
-    // 注册成功后把 session_after 回填到目标框，方便复用
     if (targetMode.value === 'register' && data.session_after) {
       try {
         targetText.value = JSON.stringify(data.session_after, null, 2)
@@ -718,11 +791,17 @@ onMounted(() => {
 
     <!-- Logs -->
     <div class="card p-4 sm:p-5">
-      <div class="mb-2 text-xs font-semibold ui-muted tracking-wide">执行日志</div>
+      <div class="mb-2 flex items-center justify-between gap-2">
+        <div class="text-xs font-semibold ui-muted tracking-wide">执行日志</div>
+        <span v-if="running" class="text-[11px] text-sky-600 dark:text-sky-400">实时流式输出中…</span>
+      </div>
       <div
+        ref="logBox"
         class="max-h-[280px] min-h-[100px] overflow-auto rounded-lg border ui-border bg-[var(--app-input)] p-3 font-mono text-[11px] leading-relaxed"
       >
-        <div v-if="!logs.length" class="ui-faint">尚无日志</div>
+        <div v-if="!logs.length" class="ui-faint">
+          {{ running ? '等待服务端日志…' : '尚无日志' }}
+        </div>
         <div v-for="(line, i) in logs" :key="i" :class="logClass(line.level)">
           [{{ formatLogTime(line.t) }}] {{ line.msg }}
         </div>

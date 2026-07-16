@@ -21,23 +21,27 @@ type JoinOwnerRequest struct {
 	Proxy          string // optional socks/http proxy URL
 	SetOwner       bool   // default true when omitted by caller
 	MaxApprove     int    // default 12
+	// OnLog is optional live log sink (SSE / UI stream). Always still collected in Result.Logs.
+	OnLog func(LogLine)
 }
 
 // JoinOwnerResult is returned to the web UI / API clients.
 type JoinOwnerResult struct {
-	OK           bool           `json:"ok"`
-	Error        string         `json:"error,omitempty"`
-	WorkspaceID  string         `json:"workspace_id,omitempty"`
-	Manager      SessionSummary `json:"manager,omitempty"`
-	Target       SessionSummary `json:"target,omitempty"`
-	Join         JoinResult     `json:"join"`
-	Approve      *ApproveResult `json:"approve,omitempty"`
-	Owner        *OwnerResult   `json:"owner,omitempty"`
-	Plan         *PlanInfo      `json:"plan,omitempty"`
-	SessionAfter map[string]any `json:"session_after,omitempty"`
-	AccountsCheck any           `json:"accounts_check,omitempty"`
-	Logs         []LogLine      `json:"logs"`
-	ProxyUsed    string         `json:"proxy_used,omitempty"`
+	OK            bool           `json:"ok"`
+	Error         string         `json:"error,omitempty"`
+	WorkspaceID   string         `json:"workspace_id,omitempty"`
+	Manager       SessionSummary `json:"manager,omitempty"`
+	Target        SessionSummary `json:"target,omitempty"`
+	Join          JoinResult     `json:"join"`
+	Approve       *ApproveResult `json:"approve,omitempty"`
+	Owner         *OwnerResult   `json:"owner,omitempty"`
+	Plan          *PlanInfo      `json:"plan,omitempty"`
+	SessionAfter  map[string]any `json:"session_after,omitempty"`
+	// SessionSource: "auth/session" if pulled from chatgpt.com, else "synthesized".
+	SessionSource string `json:"session_source,omitempty"`
+	AccountsCheck any    `json:"accounts_check,omitempty"`
+	Logs          []LogLine `json:"logs"`
+	ProxyUsed     string    `json:"proxy_used,omitempty"`
 }
 
 type SessionSummary struct {
@@ -90,7 +94,11 @@ type ParsedSession struct {
 func JoinAndSetOwner(req JoinOwnerRequest) JoinOwnerResult {
 	logs := []LogLine{}
 	log := func(level, msg string) {
-		logs = append(logs, LogLine{T: time.Now().UnixMilli(), Level: level, Msg: msg})
+		line := LogLine{T: time.Now().UnixMilli(), Level: level, Msg: msg}
+		logs = append(logs, line)
+		if req.OnLog != nil {
+			req.OnLog(line)
+		}
 	}
 
 	mgr, err := ParseSession(req.ManagerSession)
@@ -168,7 +176,7 @@ func JoinAndSetOwner(req JoinOwnerRequest) JoinOwnerResult {
 		}
 	}
 
-	// 3) accounts/check + session_after
+	// 3) accounts/check + try real /api/auth/session + session_after
 	log("info", "步骤 3/3 · 拉取 accounts/check …")
 	var plan *PlanInfo
 	var checkRaw any
@@ -178,6 +186,27 @@ func JoinAndSetOwner(req JoinOwnerRequest) JoinOwnerResult {
 		checkRaw = raw
 		plan = &p
 		log("ok", fmt.Sprintf("plan_type=%s account=%s role=%s", orDash(p.Plan), truncID(p.AccountID), orDash(p.Role)))
+	}
+
+	// Prefer live chatgpt.com/api/auth/session when cookie/token allows it.
+	// Platform OAuth-only register often cannot get a real sessionToken — then we fall back.
+	sessionSource := "synthesized"
+	if live, e := FetchAuthSession(target, proxy, workspaceID); e != nil {
+		log("warn", "auth/session: "+e.Error()+" · session_after 将用合成结构")
+	} else if live != nil {
+		// Merge live browser session as Raw so BuildSessionAfter keeps real fields
+		// (sessionToken, WARNING_BANNER, user, expires, …).
+		if target.Raw == nil {
+			target.Raw = map[string]any{}
+		}
+		for k, v := range live {
+			target.Raw[k] = v
+		}
+		if at := strAny(live["accessToken"]); at != "" {
+			target.AccessToken = at
+		}
+		sessionSource = "auth/session"
+		log("ok", "已从 chatgpt.com/api/auth/session 拉取真实 session")
 	}
 
 	sessionAfter := BuildSessionAfter(target, workspaceID, join, approve, owner, plan, setOwner)
@@ -193,6 +222,7 @@ func JoinAndSetOwner(req JoinOwnerRequest) JoinOwnerResult {
 		Owner:         owner,
 		Plan:          plan,
 		SessionAfter:  sessionAfter,
+		SessionSource: sessionSource,
 		AccountsCheck: checkRaw,
 		Logs:          logs,
 		ProxyUsed:     maskProxy(proxy),
@@ -394,6 +424,78 @@ func patchInvite(client *httpx.Client, mgr ManagerSession, inviteID string, asOw
 		last = fmt.Errorf("patch invite failed")
 	}
 	return last
+}
+
+// FetchAuthSession GETs https://chatgpt.com/api/auth/session.
+// Needs a real ChatGPT web session (cookie sessionToken) or a token that the
+// NextAuth session endpoint accepts. Pure platform OAuth AT often returns
+// empty/unauthenticated — caller must fall back to synthesis.
+func FetchAuthSession(target ParsedSession, proxy, workspaceID string) (map[string]any, error) {
+	client, err := httpx.New(proxy)
+	if err != nil {
+		return nil, err
+	}
+	defer client.Close()
+	client.SetTimeout(httpx.DefaultTimeout)
+
+	// Collect possible session cookies from pasted/raw session.
+	sessionTok := ""
+	if target.Raw != nil {
+		sessionTok = firstStr(
+			strAny(target.Raw["sessionToken"]),
+			strAny(target.Raw["session_token"]),
+		)
+	}
+
+	// Set cookies on chatgpt.com if we have sessionToken (browser session).
+	if sessionTok != "" {
+		client.SetCookie("__Secure-next-auth.session-token", sessionTok, "chatgpt.com")
+		client.SetCookie("__Secure-next-auth.session-token", sessionTok, ".chatgpt.com")
+		// Legacy name some dumps still use
+		client.SetCookie("next-auth.session-token", sessionTok, "chatgpt.com")
+	}
+
+	deviceID := randomID()
+	headers := map[string]string{
+		"accept":       "application/json",
+		"oai-device-id": deviceID,
+		"oai-language": "zh-CN",
+		"referer":      ChatGPTBase + "/",
+		"origin":       ChatGPTBase,
+		"user-agent":   httpx.UserAgent,
+	}
+	if target.AccessToken != "" {
+		headers["authorization"] = "Bearer " + target.AccessToken
+	}
+	if workspaceID != "" {
+		headers["chatgpt-account-id"] = workspaceID
+	}
+
+	resp, err := client.Get(ChatGPTBase+"/api/auth/session", headers, true)
+	if err != nil {
+		return nil, err
+	}
+	if resp.StatusCode != 200 {
+		return nil, fmt.Errorf("HTTP %d: %s", resp.StatusCode, httpx.DumpSnippet(resp.Body, 160))
+	}
+	var data map[string]any
+	if err := json.Unmarshal(resp.Body, &data); err != nil {
+		return nil, fmt.Errorf("invalid json: %w", err)
+	}
+	// Unauthenticated NextAuth often returns {} or null-ish without accessToken.
+	at := strAny(data["accessToken"])
+	if at == "" {
+		at = strAny(data["access_token"])
+	}
+	user, _ := data["user"].(map[string]any)
+	if at == "" && (user == nil || strAny(user["email"]) == "") {
+		snippet := strings.TrimSpace(string(resp.Body))
+		if len(snippet) > 120 {
+			snippet = snippet[:120] + "…"
+		}
+		return nil, fmt.Errorf("empty/unauthenticated session body=%s", snippet)
+	}
+	return data, nil
 }
 
 // AccountsCheck returns full accounts/check JSON + selected plan info.
@@ -658,6 +760,8 @@ func BuildSessionAfter(
 	}
 	// id_token is oauth, not browser session field
 	delete(base, "id_token")
+	// internal marker may be re-set by caller
+	delete(base, "_session_source")
 
 	return base
 }

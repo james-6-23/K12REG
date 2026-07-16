@@ -35,6 +35,9 @@ import (
 //
 // Register mode: load email pool with alias_count=1 (no plus-aliases), take the
 // last free mailbox, run protocol register, mark used, then join+set-owner.
+//
+// Streaming: send Accept: text/event-stream or ?stream=1 for live log SSE
+// (event: log / event: result / event: error).
 func (s *Server) handleJoinOwner(w http.ResponseWriter, r *http.Request) {
 	if !s.auth.require(w, r) {
 		return
@@ -102,7 +105,45 @@ func (s *Server) handleJoinOwner(w http.ResponseWriter, r *http.Request) {
 		mode = "session"
 	}
 
+	// Live SSE stream for UI (register can take minutes on OTP).
+	wantStream := r.URL.Query().Get("stream") == "1" ||
+		strings.Contains(r.Header.Get("Accept"), "text/event-stream")
+	var (
+		flusher http.Flusher
+		stream  bool
+	)
+	if wantStream {
+		if f, ok := w.(http.Flusher); ok {
+			stream = true
+			flusher = f
+			w.Header().Set("Content-Type", "text/event-stream; charset=utf-8")
+			w.Header().Set("Cache-Control", "no-cache, no-transform")
+			w.Header().Set("Connection", "keep-alive")
+			w.Header().Set("X-Accel-Buffering", "no")
+			w.WriteHeader(http.StatusOK)
+			flusher.Flush()
+		}
+	}
+
+	writeSSE := func(event string, v any) {
+		if !stream {
+			return
+		}
+		b, err := json.Marshal(v)
+		if err != nil {
+			return
+		}
+		_, _ = fmt.Fprintf(w, "event: %s\ndata: %s\n\n", event, b)
+		if flusher != nil {
+			flusher.Flush()
+		}
+	}
+
 	preLogs := []workspace.LogLine{}
+	onLog := func(line workspace.LogLine) {
+		preLogs = append(preLogs, line)
+		writeSSE("log", line)
+	}
 
 	var target any
 	switch mode {
@@ -112,23 +153,33 @@ func (s *Server) handleJoinOwner(w http.ResponseWriter, r *http.Request) {
 			target = body.Session
 		}
 		if target == nil {
+			if stream {
+				writeSSE("error", map[string]any{"ok": false, "error": "缺少 target_session", "logs": preLogs})
+				return
+			}
 			writeJSON(w, http.StatusBadRequest, map[string]string{"detail": "缺少 target_session"})
 			return
 		}
 	case "register", "pool", "mail":
-		// Long-running: registration + OTP. Client has no short timeout by default.
-		regTarget, regLogs, regErr := s.registerTargetFromPool(r.Context(), cfg, body.MailboxesFile, proxy)
-		preLogs = append(preLogs, regLogs...)
+		regTarget, regErr := s.registerTargetFromPool(r.Context(), cfg, body.MailboxesFile, proxy, onLog)
 		if regErr != nil {
+			if stream {
+				writeSSE("result", map[string]any{
+					"ok": false, "error": regErr.Error(), "logs": preLogs,
+				})
+				return
+			}
 			writeJSON(w, http.StatusUnprocessableEntity, map[string]any{
-				"ok":    false,
-				"error": regErr.Error(),
-				"logs":  preLogs,
+				"ok": false, "error": regErr.Error(), "logs": preLogs,
 			})
 			return
 		}
 		target = regTarget
 	default:
+		if stream {
+			writeSSE("error", map[string]any{"ok": false, "error": "target_mode 应为 session 或 register"})
+			return
+		}
 		writeJSON(w, http.StatusBadRequest, map[string]string{
 			"detail": "target_mode 应为 session 或 register",
 		})
@@ -141,12 +192,17 @@ func (s *Server) handleJoinOwner(w http.ResponseWriter, r *http.Request) {
 		Proxy:          proxy,
 		SetOwner:       setOwner,
 		MaxApprove:     maxAttempts,
+		OnLog:          onLog,
 	})
-	// Prepend registration logs so the UI shows the full flow.
+	// onLog already collected register + join into preLogs in order.
 	if len(preLogs) > 0 {
-		res.Logs = append(preLogs, res.Logs...)
+		res.Logs = preLogs
 	}
 
+	if stream {
+		writeSSE("result", res)
+		return
+	}
 	status := http.StatusOK
 	if !res.OK {
 		status = http.StatusUnprocessableEntity
@@ -161,11 +217,15 @@ func (s *Server) registerTargetFromPool(
 	ctx context.Context,
 	cfg config.Config,
 	mailboxesFile, preferredProxy string,
-) (session map[string]any, logs []workspace.LogLine, err error) {
+	onLog func(workspace.LogLine),
+) (session map[string]any, err error) {
 	log := func(level, msg string) {
-		logs = append(logs, workspace.LogLine{
+		line := workspace.LogLine{
 			T: time.Now().UnixMilli(), Level: level, Msg: msg,
-		})
+		}
+		if onLog != nil {
+			onLog(line)
+		}
 	}
 	if ctx == nil {
 		ctx = context.Background()
@@ -179,7 +239,7 @@ func (s *Server) registerTargetFromPool(
 		name = firstMailPoolFile(s.opt.DataDir)
 	}
 	if name == "" {
-		return nil, logs, fmt.Errorf("未配置邮箱池文件（请选择 hotmail.txt 等）")
+		return nil, fmt.Errorf("未配置邮箱池文件（请选择 hotmail.txt 等）")
 	}
 
 	mailFile := name
@@ -187,7 +247,7 @@ func (s *Server) registerTargetFromPool(
 		mailFile = filepath.Join(s.opt.DataDir, name)
 	}
 	if st, e := os.Stat(mailFile); e != nil || st.IsDir() {
-		return nil, logs, fmt.Errorf("邮箱池文件不存在: %s", name)
+		return nil, fmt.Errorf("邮箱池文件不存在: %s", name)
 	}
 
 	statePath := filepath.Join(s.opt.DataDir, "outlook_token_state.json")
@@ -195,7 +255,7 @@ func (s *Server) registerTargetFromPool(
 	const aliasCount = 1
 	pool, e := mail.LoadPool(mailFile, statePath, aliasCount)
 	if e != nil {
-		return nil, logs, fmt.Errorf("加载邮箱池: %w", e)
+		return nil, fmt.Errorf("加载邮箱池: %w", e)
 	}
 
 	// Seed used from data dir so already-registered / session-json emails are skipped.
@@ -243,14 +303,14 @@ func (s *Server) registerTargetFromPool(
 
 	for mailTry := 1; mailTry <= maxMailboxes; mailTry++ {
 		if err := ctx.Err(); err != nil {
-			return nil, logs, err
+			return nil, err
 		}
 		mb, acqErr := pool.AcquireFromEnd()
 		if acqErr != nil {
 			if lastErr != nil {
-				return nil, logs, fmt.Errorf("取邮箱失败（上一号: %v）: %w", lastErr, acqErr)
+				return nil, fmt.Errorf("取邮箱失败（上一号: %v）: %w", lastErr, acqErr)
 			}
-			return nil, logs, fmt.Errorf("取邮箱: %w", acqErr)
+			return nil, fmt.Errorf("取邮箱: %w", acqErr)
 		}
 		lastMB = mb
 		log("info", fmt.Sprintf("已取邮箱（末尾 #%d/%d）· %s · in_use", mailTry, maxMailboxes, mb.Address))
@@ -261,7 +321,7 @@ func (s *Server) registerTargetFromPool(
 		for attempt := 1; attempt <= proxyRetries; attempt++ {
 			if err := ctx.Err(); err != nil {
 				pool.Release(mb)
-				return nil, logs, err
+				return nil, err
 			}
 			px := proxies[(attempt-1)%len(proxies)]
 			usedPx = px
@@ -285,7 +345,7 @@ func (s *Server) registerTargetFromPool(
 			}
 			if ctx.Err() != nil {
 				pool.Release(mb)
-				return nil, logs, ctx.Err()
+				return nil, ctx.Err()
 			}
 			if mail.IsGraphAuthPermanent(lastErr) {
 				pool.MarkGraphDead(mb)
@@ -330,7 +390,7 @@ func (s *Server) registerTargetFromPool(
 				"created_at":    reg.CreatedAt,
 			}
 			_ = usedPx
-			return session, logs, nil
+			return session, nil
 		}
 
 		// Failed this mailbox → always mark used so it is never re-taken.
@@ -343,7 +403,7 @@ func (s *Server) registerTargetFromPool(
 	}
 	log("err", fmt.Sprintf("注册失败（已尝试 %d 个邮箱，末号 %s）: %v",
 		maxMailboxes, lastMB.Address, lastErr))
-	return nil, logs, fmt.Errorf("注册失败: %w", lastErr)
+	return nil, fmt.Errorf("注册失败: %w", lastErr)
 }
 
 // collectKnownEmails gathers addresses that must not be re-registered:
