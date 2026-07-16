@@ -326,7 +326,8 @@ async function runJoin() {
     const reader = res.body.getReader()
     const decoder = new TextDecoder()
     let buf = ''
-    let finalResult: JoinOwnerResult | null = null
+    // Use a box so assignments inside handleEvent are visible to control-flow (not never).
+    const streamState: { final: JoinOwnerResult | null } = { final: null }
 
     const handleEvent = (event: string, dataStr: string) => {
       let data: unknown
@@ -339,12 +340,11 @@ async function runJoin() {
         const line = data as LogLine
         if (line && typeof line.msg === 'string') {
           logs.value = [...logs.value, line]
-          // watch(logs.length) will scroll
         }
         return
       }
       if (event === 'result' || event === 'error') {
-        finalResult = data as JoinOwnerResult
+        streamState.final = data as JoinOwnerResult
       }
     }
 
@@ -352,7 +352,6 @@ async function runJoin() {
       const { done, value } = await reader.read()
       if (done) break
       buf += decoder.decode(value, { stream: true })
-      // Parse SSE blocks separated by blank lines
       for (;;) {
         const sep = buf.indexOf('\n\n')
         if (sep < 0) break
@@ -369,10 +368,10 @@ async function runJoin() {
       }
     }
 
-    if (!finalResult) {
+    const data = streamState.final
+    if (!data) {
       throw new Error('流结束但未收到 result 事件')
     }
-    const data = finalResult
     result.value = data
     if (Array.isArray(data.logs) && data.logs.length && logs.value.length < data.logs.length) {
       logs.value = data.logs
