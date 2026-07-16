@@ -331,12 +331,57 @@ func (p *Pool) Mark(mb Mailbox, success bool) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	key := strings.ToLower(mb.Address)
-	if success {
-		p.state[key] = "used"
-	} else {
-		p.state[key] = "failed"
+	base := strings.ToLower(strings.TrimSpace(mb.BaseEmail))
+	if base == "" {
+		base = key
+	}
+	// Join-owner / burn stock: always treat as used so the same line is never
+	// handed out again (failed also burns — pool is one-shot per address).
+	st := "used"
+	if !success {
+		// Keep distinct status for stats, but base is still blocked via entryUsable.
+		st = "failed"
+	}
+	p.state[key] = st
+	// Block the whole base inbox (aliases + re-acquire of base).
+	if success || p.state[base] != "used" {
+		if success {
+			p.state[base] = "used"
+		} else if p.state[base] == "" || p.state[base] == "in_use" || p.state[base] == "failed" {
+			// failed base still unusable (entryUsable treats failed as dead)
+			p.state[base] = "failed"
+		}
 	}
 	p.saveState()
+}
+
+// SeedUsed marks emails as used without acquiring (e.g. already have session
+// files or rows in registered_accounts). Returns how many newly marked.
+func (p *Pool) SeedUsed(emails []string) int {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	n := 0
+	for _, e := range emails {
+		key := strings.ToLower(strings.TrimSpace(e))
+		if key == "" || !strings.Contains(key, "@") {
+			continue
+		}
+		cur := p.state[key]
+		if cur == "used" || cur == "token_invalid" {
+			continue
+		}
+		p.state[key] = "used"
+		n++
+	}
+	if n > 0 {
+		p.saveState()
+	}
+	return n
+}
+
+// MarkUsed forces address + base to used (consumed stock).
+func (p *Pool) MarkUsed(mb Mailbox) {
+	p.Mark(mb, true)
 }
 
 // MarkGraphDead marks mailbox as used (consumed) when Graph token is permanently dead

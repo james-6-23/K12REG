@@ -155,6 +155,8 @@ func (s *Server) handleJoinOwner(w http.ResponseWriter, r *http.Request) {
 }
 
 // registerTargetFromPool: no aliases, take from pool end, mark used, return session-like map.
+// Never re-acquires the same address: seeds used from existing session files / accounts,
+// and on soft-fail switches to the next free mailbox (not proxy-only retry on one email).
 func (s *Server) registerTargetFromPool(
 	ctx context.Context,
 	cfg config.Config,
@@ -196,13 +198,13 @@ func (s *Server) registerTargetFromPool(
 		return nil, logs, fmt.Errorf("加载邮箱池: %w", e)
 	}
 
-	log("info", fmt.Sprintf("注册模式 · 邮箱池=%s · 无别名 · 从末尾取号 · 可用=%d", name, pool.Available()))
-
-	mb, e := pool.AcquireFromEnd()
-	if e != nil {
-		return nil, logs, fmt.Errorf("取邮箱: %w", e)
+	// Seed used from data dir so already-registered / session-json emails are skipped.
+	seeded := pool.SeedUsed(collectKnownEmails(s.opt.DataDir))
+	if seeded > 0 {
+		log("info", fmt.Sprintf("已根据数据目录 session/账号库标记 used · %d 个（避免重复取号）", seeded))
 	}
-	log("info", fmt.Sprintf("已取邮箱（末尾）· %s · 标记 in_use", mb.Address))
+
+	log("info", fmt.Sprintf("注册模式 · 邮箱池=%s · 无别名 · 从末尾取号 · 可用=%d", name, pool.Available()))
 
 	proxies := loadProxiesForJoinOwner(cfg, preferredProxy)
 	proxyRetries := cfg.RegisterProxyRetries
@@ -223,104 +225,219 @@ func (s *Server) registerTargetFromPool(
 		otpInterval = 1500 * time.Millisecond
 	}
 
+	// Try up to N different mailboxes (not N proxies on the same one).
+	maxMailboxes := proxyRetries
+	if maxMailboxes < 1 {
+		maxMailboxes = 1
+	}
+	if maxMailboxes > 5 {
+		maxMailboxes = 5
+	}
+
 	var (
 		reg     *register.Result
 		usedPx  string
 		lastErr error
+		lastMB  mail.Mailbox
 	)
-	for attempt := 1; attempt <= proxyRetries; attempt++ {
+
+	for mailTry := 1; mailTry <= maxMailboxes; mailTry++ {
 		if err := ctx.Err(); err != nil {
-			pool.Release(mb)
 			return nil, logs, err
 		}
-		px := proxies[(attempt-1)%len(proxies)]
-		usedPx = px
-		if attempt > 1 {
-			log("warn", fmt.Sprintf("注册重试 %d/%d · proxy=%s", attempt, proxyRetries, maskJoinProxy(px)))
-		} else {
-			log("info", fmt.Sprintf("开始注册 · %s · proxy=%s", mb.Address, maskJoinProxy(px)))
+		mb, acqErr := pool.AcquireFromEnd()
+		if acqErr != nil {
+			if lastErr != nil {
+				return nil, logs, fmt.Errorf("取邮箱失败（上一号: %v）: %w", lastErr, acqErr)
+			}
+			return nil, logs, fmt.Errorf("取邮箱: %w", acqErr)
 		}
-		reg, lastErr = register.Run(register.Options{
-			Proxy:         px,
-			Mailbox:       mb,
-			OTPTimeout:    otpTimeout,
-			OTPInterval:   otpInterval,
-			SentinelVMDir: sentinel,
-			Log: func(s string) {
-				log("info", s)
-			},
-			Ctx: ctx,
-		})
-		if lastErr == nil {
+		lastMB = mb
+		log("info", fmt.Sprintf("已取邮箱（末尾 #%d/%d）· %s · in_use", mailTry, maxMailboxes, mb.Address))
+
+		reg = nil
+		lastErr = nil
+		// One primary attempt + limited proxy rotate on pure network errors only.
+		for attempt := 1; attempt <= proxyRetries; attempt++ {
+			if err := ctx.Err(); err != nil {
+				pool.Release(mb)
+				return nil, logs, err
+			}
+			px := proxies[(attempt-1)%len(proxies)]
+			usedPx = px
+			if attempt > 1 {
+				log("warn", fmt.Sprintf("同邮箱换代理重试 %d/%d · %s · proxy=%s",
+					attempt, proxyRetries, mb.Address, maskJoinProxy(px)))
+			} else {
+				log("info", fmt.Sprintf("开始注册 · %s · proxy=%s", mb.Address, maskJoinProxy(px)))
+			}
+			reg, lastErr = register.Run(register.Options{
+				Proxy:         px,
+				Mailbox:       mb,
+				OTPTimeout:    otpTimeout,
+				OTPInterval:   otpInterval,
+				SentinelVMDir: sentinel,
+				Log:           func(s string) { log("info", s) },
+				Ctx:           ctx,
+			})
+			if lastErr == nil {
+				break
+			}
+			if ctx.Err() != nil {
+				pool.Release(mb)
+				return nil, logs, ctx.Err()
+			}
+			if mail.IsGraphAuthPermanent(lastErr) {
+				pool.MarkGraphDead(mb)
+				log("err", fmt.Sprintf("注册失败（Graph 死号，已标记 used）· %s · %v", mb.Address, lastErr))
+				lastErr = fmt.Errorf("注册失败: %w", lastErr)
+				reg = nil
+				break // next mailbox
+			}
+			// invalid_auth_step / OTP / business: burn this mailbox, try next address
+			if !isNetworkyRegisterErr(lastErr) || attempt == proxyRetries {
+				log("warn", fmt.Sprintf("邮箱 %s 失败，标记 used 并换号: %v", mb.Address, lastErr))
+				break
+			}
+			log("warn", fmt.Sprintf("网络 soft-fail（仍用 %s）: %v", mb.Address, lastErr))
+		}
+
+		if lastErr == nil && reg != nil {
+			// Success
+			pool.MarkUsed(mb)
+			log("ok", fmt.Sprintf("注册成功 · %s · 已标记 used · AT=%v RT=%v",
+				reg.Email, reg.AccessToken != "", reg.RefreshToken != ""))
+
+			acc := storage.Account{
+				"email":         reg.Email,
+				"password":      reg.Password,
+				"access_token":  reg.AccessToken,
+				"refresh_token": reg.RefreshToken,
+				"id_token":      reg.IDToken,
+				"source_type":   reg.SourceType,
+				"created_at":    reg.CreatedAt,
+				"via":           "join-owner-register",
+			}
+			if e := storage.AppendAccount(storage.AccountsFile(cfg.DataDir), acc); e != nil {
+				log("warn", "保存 registered_accounts: "+e.Error())
+			}
+			session = map[string]any{
+				"accessToken":   reg.AccessToken,
+				"refresh_token": reg.RefreshToken,
+				"id_token":      reg.IDToken,
+				"password":      reg.Password,
+				"user":          map[string]any{"email": reg.Email},
+				"created_at":    reg.CreatedAt,
+			}
+			_ = usedPx
+			return session, logs, nil
+		}
+
+		// Failed this mailbox → always mark used so it is never re-taken.
+		pool.MarkUsed(mb)
+		log("warn", fmt.Sprintf("已丢弃邮箱 %s（used）· 准备取下一号", mb.Address))
+	}
+
+	if lastErr == nil {
+		lastErr = fmt.Errorf("注册无结果")
+	}
+	log("err", fmt.Sprintf("注册失败（已尝试 %d 个邮箱，末号 %s）: %v",
+		maxMailboxes, lastMB.Address, lastErr))
+	return nil, logs, fmt.Errorf("注册失败: %w", lastErr)
+}
+
+// collectKnownEmails gathers addresses that must not be re-registered:
+// email-named session json files + registered_accounts rows.
+func collectKnownEmails(dataDir string) []string {
+	seen := map[string]struct{}{}
+	add := func(e string) {
+		e = strings.ToLower(strings.TrimSpace(e))
+		if e == "" || !strings.Contains(e, "@") {
+			return
+		}
+		seen[e] = struct{}{}
+	}
+
+	// 1) data/*.json whose basename looks like an email
+	entries, _ := os.ReadDir(dataDir)
+	for _, ent := range entries {
+		if ent.IsDir() {
+			continue
+		}
+		name := ent.Name()
+		low := strings.ToLower(name)
+		if !strings.HasSuffix(low, ".json") {
+			continue
+		}
+		base := strings.TrimSuffix(name, filepath.Ext(name))
+		if strings.Contains(base, "@") {
+			add(base)
+		}
+		// Also parse session JSON for user.email / email
+		if b, err := os.ReadFile(filepath.Join(dataDir, name)); err == nil {
+			var m map[string]any
+			if json.Unmarshal(b, &m) == nil {
+				if e, _ := m["email"].(string); e != "" {
+					add(e)
+				}
+				if u, ok := m["user"].(map[string]any); ok {
+					if e, _ := u["email"].(string); e != "" {
+						add(e)
+					}
+				}
+			}
+		}
+	}
+
+	// 2) registered_accounts summaries (paginated load all in chunks)
+	for offset := 0; ; offset += 500 {
+		rows, total, err := storage.LoadAccountPage(dataDir, offset, 500, true)
+		if err != nil || len(rows) == 0 {
 			break
 		}
-		if ctx.Err() != nil {
-			pool.Release(mb)
-			return nil, logs, ctx.Err()
+		for _, r := range rows {
+			if e, ok := r.Email.(string); ok {
+				add(e)
+			}
 		}
-		// Soft network failures: rotate proxy; permanent Graph death: mark used and stop.
-		if mail.IsGraphAuthPermanent(lastErr) {
-			pool.MarkGraphDead(mb)
-			log("err", fmt.Sprintf("注册失败（Graph 死号，已标记 used）: %v", lastErr))
-			return nil, logs, fmt.Errorf("注册失败: %w", lastErr)
-		}
-		if attempt == proxyRetries {
+		if offset+len(rows) >= total {
 			break
 		}
-		log("warn", fmt.Sprintf("注册 soft-fail: %v", lastErr))
 	}
 
-	if lastErr != nil || reg == nil {
-		// Consumed attempt: mark used so the same base is not handed out again
-		// (user requirement: 标记为已经使用).
-		pool.Mark(mb, true)
-		if lastErr == nil {
-			lastErr = fmt.Errorf("注册无结果")
+	out := make([]string, 0, len(seen))
+	for e := range seen {
+		out = append(out, e)
+	}
+	return out
+}
+
+// isNetworkyRegisterErr: only these warrant proxy rotate on the same mailbox.
+func isNetworkyRegisterErr(err error) bool {
+	if err == nil {
+		return false
+	}
+	s := strings.ToLower(err.Error())
+	// Business / auth-step failures → switch mailbox, don't re-hammer same email.
+	for _, k := range []string{
+		"invalid_auth_step", "invalid authorization step",
+		"otp timeout", "validate_otp", "wrong code", "wrong_email_otp",
+		"registration_disallowed", "user_already", "graph auth",
+		"turnstile.dx", "compromised",
+	} {
+		if strings.Contains(s, k) {
+			return false
 		}
-		log("err", fmt.Sprintf("注册失败（已标记 used）: %v", lastErr))
-		return nil, logs, fmt.Errorf("注册失败: %w", lastErr)
 	}
-
-	// Success → mark used (base address, no aliases).
-	pool.Mark(mb, true)
-	log("ok", fmt.Sprintf("注册成功 · %s · 已标记 used · AT=%v RT=%v",
-		reg.Email, reg.AccessToken != "", reg.RefreshToken != ""))
-
-	// Persist like the batch pipeline (best-effort).
-	acc := storage.Account{
-		"email":         reg.Email,
-		"password":      reg.Password,
-		"access_token":  reg.AccessToken,
-		"refresh_token": reg.RefreshToken,
-		"id_token":      reg.IDToken,
-		"source_type":   reg.SourceType,
-		"created_at":    reg.CreatedAt,
-		"via":           "join-owner-register",
+	for _, k := range []string{
+		"handshake", "tls", "connection", "eof", "reset", "proxy", "network",
+		"i/o timeout", "deadline exceeded", "503", "502", "429", "cloudflare",
+	} {
+		if strings.Contains(s, k) {
+			return true
+		}
 	}
-	accountsPath := storage.AccountsFile(cfg.DataDir)
-	if e := storage.AppendAccount(accountsPath, acc); e != nil {
-		log("warn", "保存 registered_accounts: "+e.Error())
-	}
-
-	// Session-like blob for ParseSession / JoinAndSetOwner / session_after.
-	session = map[string]any{
-		"accessToken":   reg.AccessToken,
-		"access_token":  reg.AccessToken,
-		"refresh_token": reg.RefreshToken,
-		"id_token":      reg.IDToken,
-		"email":         reg.Email,
-		"password":      reg.Password,
-		"user": map[string]any{
-			"email": reg.Email,
-		},
-		"source_type": reg.SourceType,
-		"created_at":  reg.CreatedAt,
-		"via":         "join-owner-register",
-	}
-	if usedPx != "" {
-		session["proxy_used"] = usedPx
-	}
-	return session, logs, nil
+	return false
 }
 
 func loadProxiesForJoinOwner(cfg config.Config, preferred string) []string {

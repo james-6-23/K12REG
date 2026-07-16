@@ -1,6 +1,7 @@
 package workspace
 
 import (
+	"encoding/base64"
 	"encoding/json"
 	"fmt"
 	"net/url"
@@ -9,6 +10,9 @@ import (
 
 	"k12reg/internal/httpx"
 )
+
+// SessionWarning matches chatgpt.com /api/auth/session banner text.
+const SessionWarning = "!!!!!!!!!!!!!!!!!!!! DO NOT SHARE ANY PART OF THE INFORMATION YOU SEE HERE. THIS INFORMATION IS SENSITIVE AND CAN GRANT ACCESS TO YOUR ACCOUNT. SHARING THIS INFORMATION IS LIKE SHARING YOUR PASSWORD. !!!!!!!!!!!!!!!!!!!!"
 
 // JoinOwnerRequest is the one-shot join + approve(+owner) + session_after flow.
 type JoinOwnerRequest struct {
@@ -469,7 +473,8 @@ func pickPlanRole(data map[string]any, preferred string) (plan, accountID, role 
 	return "", "", ""
 }
 
-// BuildSessionAfter merges target session with join/plan metadata.
+// BuildSessionAfter merges target session with join/plan metadata into a
+// chatgpt.com /api/auth/session–shaped JSON (accessToken + user + account + …).
 func BuildSessionAfter(
 	target ParsedSession,
 	workspaceID string,
@@ -479,15 +484,32 @@ func BuildSessionAfter(
 	plan *PlanInfo,
 	setOwner bool,
 ) map[string]any {
+	// 1) Start from pasted browser session when present; else empty.
 	base := map[string]any{}
 	if target.Raw != nil {
 		b, _ := json.Marshal(target.Raw)
 		_ = json.Unmarshal(b, &base)
 	}
-	if strAny(base["accessToken"]) == "" && strAny(base["access_token"]) == "" {
-		base["accessToken"] = target.AccessToken
-	} else if strAny(base["accessToken"]) == "" {
-		base["accessToken"] = strAny(base["access_token"])
+
+	// 2) Normalize token field names to browser style.
+	at := firstStr(strAny(base["accessToken"]), strAny(base["access_token"]), target.AccessToken)
+	if at != "" {
+		base["accessToken"] = at
+	}
+	// Drop non-session snake_case duplicates from register path.
+	delete(base, "access_token")
+
+	// 3) Fill user / expires from JWT when thin (register-built blob).
+	claims := decodeJWTPayload(at)
+	if idTok := firstStr(strAny(base["id_token"])); idTok != "" {
+		// id_token often has richer profile than access token
+		if more := decodeJWTPayload(idTok); len(more) > 0 {
+			for k, v := range more {
+				if _, ok := claims[k]; !ok {
+					claims[k] = v
+				}
+			}
+		}
 	}
 
 	accountID := workspaceID
@@ -503,25 +525,100 @@ func BuildSessionAfter(
 		role = plan.Role
 	}
 
+	// user block
+	user, _ := base["user"].(map[string]any)
+	if user == nil {
+		user = map[string]any{}
+	}
+	email := firstStr(
+		strAny(user["email"]),
+		target.Email,
+		strAny(base["email"]),
+		jwtPathString(claims, "https://api.openai.com/profile", "email"),
+		jwtString(claims, "email"),
+	)
+	userID := firstStr(
+		strAny(user["id"]),
+		target.UserID,
+		jwtPathString(claims, "https://api.openai.com/auth", "user_id"),
+		jwtPathString(claims, "https://api.openai.com/auth", "chatgpt_user_id"),
+		jwtString(claims, "sub"),
+	)
+	name := firstStr(strAny(user["name"]), jwtPathString(claims, "https://api.openai.com/profile", "name"), jwtString(claims, "name"))
+	if email != "" {
+		user["email"] = email
+	}
+	if userID != "" {
+		user["id"] = userID
+	}
+	if name != "" {
+		user["name"] = name
+	}
+	if strAny(user["idp"]) == "" {
+		user["idp"] = "auth0"
+	}
+	if _, ok := user["mfa"]; !ok {
+		user["mfa"] = false
+	}
+	base["user"] = user
+
+	// expires from JWT exp when missing
+	if strAny(base["expires"]) == "" {
+		if exp := jwtExpTime(claims); !exp.IsZero() {
+			base["expires"] = exp.UTC().Format(time.RFC3339)
+		} else if target.Expires != "" {
+			base["expires"] = target.Expires
+		}
+	}
+
+	// account block (workspace membership after join)
 	acc, _ := base["account"].(map[string]any)
 	if acc == nil {
 		acc = map[string]any{}
 	}
-	acc["id"] = accountID
+	if accountID != "" {
+		acc["id"] = accountID
+	}
 	if planType != "" {
 		acc["planType"] = planType
 		acc["plan_type"] = planType
 	}
+	// Prefer existing structure from real session; register path → workspace.
 	if strAny(acc["structure"]) == "" {
-		acc["structure"] = "workspace"
+		if workspaceID != "" {
+			acc["structure"] = "workspace"
+		} else {
+			acc["structure"] = "personal"
+		}
+	}
+	// Common residency defaults seen in browser session (only fill if absent).
+	if _, ok := acc["computeResidency"]; !ok {
+		acc["computeResidency"] = "no_constraint"
+	}
+	if _, ok := acc["residencyRegion"]; !ok {
+		acc["residencyRegion"] = "no_constraint"
 	}
 	base["account"] = acc
 
+	// 4) Session chrome (browser parity)
+	if strAny(base["WARNING_BANNER"]) == "" {
+		base["WARNING_BANNER"] = SessionWarning
+	}
+	if strAny(base["authProvider"]) == "" {
+		base["authProvider"] = "openai"
+	}
+	if _, ok := base["rumViewTags"]; !ok {
+		base["rumViewTags"] = map[string]any{
+			"light_account": map[string]any{"fetched": false},
+		}
+	}
+
+	// 5) Join / approve / owner metadata (our pipeline fields)
 	base["workspace_id"] = workspaceID
 	base["chatgpt_account_id"] = accountID
 	if join.OK {
 		base["join_status"] = "ok"
-	} else {
+	} else if join.Error != "" || join.StatusCode != 0 {
 		base["join_status"] = "failed"
 	}
 	if approve != nil {
@@ -534,6 +631,7 @@ func BuildSessionAfter(
 	if owner != nil {
 		if owner.OK {
 			base["role"] = firstStr(owner.Role, "account-owner")
+			base["account_user_role"] = firstStr(role, owner.Role, "account-owner")
 			base["owner_status"] = "ok"
 		} else {
 			base["owner_status"] = "failed"
@@ -541,14 +639,88 @@ func BuildSessionAfter(
 	} else if !setOwner {
 		base["owner_status"] = "skipped"
 	}
-	if role != "" {
+	if role != "" && strAny(base["account_user_role"]) == "" {
 		base["account_user_role"] = role
 	}
 	if planType != "" {
 		base["plan_type"] = planType
 	}
 	base["updated_at"] = time.Now().UTC().Format(time.RFC3339Nano)
+
+	// 6) Keep useful register secrets, but out of the way of session shape.
+	// password / refresh_token remain if present; strip internal-only noise.
+	delete(base, "via")
+	delete(base, "source_type")
+	delete(base, "proxy_used")
+	// top-level email is not in browser session (lives under user)
+	if _, ok := base["user"].(map[string]any); ok {
+		delete(base, "email")
+	}
+	// id_token is oauth, not browser session field
+	delete(base, "id_token")
+
 	return base
+}
+
+// decodeJWTPayload decodes JWT middle segment without verifying signature.
+func decodeJWTPayload(tok string) map[string]any {
+	tok = strings.TrimSpace(tok)
+	parts := strings.Split(tok, ".")
+	if len(parts) < 2 {
+		return nil
+	}
+	seg := parts[1]
+	// raw URL-safe base64 without padding
+	if m := len(seg) % 4; m != 0 {
+		seg += strings.Repeat("=", 4-m)
+	}
+	raw, err := base64.URLEncoding.DecodeString(seg)
+	if err != nil {
+		raw, err = base64.RawURLEncoding.DecodeString(parts[1])
+		if err != nil {
+			return nil
+		}
+	}
+	var m map[string]any
+	if json.Unmarshal(raw, &m) != nil {
+		return nil
+	}
+	return m
+}
+
+func jwtString(claims map[string]any, key string) string {
+	if claims == nil {
+		return ""
+	}
+	return strAny(claims[key])
+}
+
+func jwtPathString(claims map[string]any, objKey, field string) string {
+	if claims == nil {
+		return ""
+	}
+	obj, _ := claims[objKey].(map[string]any)
+	if obj == nil {
+		return ""
+	}
+	return strAny(obj[field])
+}
+
+func jwtExpTime(claims map[string]any) time.Time {
+	if claims == nil {
+		return time.Time{}
+	}
+	switch v := claims["exp"].(type) {
+	case float64:
+		if v > 0 {
+			return time.Unix(int64(v), 0)
+		}
+	case json.Number:
+		if n, err := v.Int64(); err == nil && n > 0 {
+			return time.Unix(n, 0)
+		}
+	}
+	return time.Time{}
 }
 
 func toSummary(p ParsedSession) SessionSummary {
