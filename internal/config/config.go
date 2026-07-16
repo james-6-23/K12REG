@@ -42,6 +42,11 @@ type Config struct {
 	ApproveMaxAttempts  int
 	// RequireSameDomain: child email domain must match manager (K12 policy).
 	RequireSameDomain bool
+	// MailBinding: "shared" = one global mail pool (all managers same domain);
+	// "per_manager" = each manager may set its own mailboxes_file.
+	MailBinding string
+	// Managers: multi mother-session slots (quota per workspace). Empty → legacy single manager.
+	Managers []ManagerSlot
 
 	// Import APIs (optional; may push to multiple account pools)
 	ImportEnabled    bool // true when any endpoint is enabled
@@ -65,6 +70,19 @@ type ImportEndpoint struct {
 	RequireK12 bool
 }
 
+// ManagerSlot is one mother session / workspace to fill during a batch run.
+type ManagerSlot struct {
+	Enabled        bool
+	SessionFile    string // e.g. session.json / space-a.json
+	Quota          int    // accounts to register+join into this workspace
+	MailboxesFile  string // optional; used when MailBinding=per_manager
+	// Filled at runtime from session JSON (not always persisted):
+	WorkspaceID string
+	Email       string
+	Domain      string
+	Label       string // optional display name
+}
+
 func Default() Config {
 	return Config{
 		DataDir:              ".",
@@ -80,8 +98,9 @@ func Default() Config {
 		WorkspaceRoute:       "request",
 		ApproveRequests:      true,
 		ManagerSessionFile:   "hotsession.json",
-		ApproveMaxAttempts:   12,
+		ApproveMaxAttempts:   8, // short backoff; ~12–20s list poll budget
 		RequireSameDomain:    true,
+		MailBinding:          "shared",
 		ImportRequireK12:     true,
 	}
 }
@@ -176,6 +195,9 @@ func (c *Config) ApplyMap(raw map[string]any) {
 		if v, ok := m["require_same_domain"].(bool); ok {
 			c.RequireSameDomain = v
 		}
+		if v, ok := m["mail_binding"].(string); ok && strings.TrimSpace(v) != "" {
+			c.MailBinding = strings.ToLower(strings.TrimSpace(v))
+		}
 		if ids, ok := m["ids"].([]any); ok {
 			c.WorkspaceIDs = nil
 			for _, id := range ids {
@@ -194,6 +216,42 @@ func (c *Config) ApplyMap(raw map[string]any) {
 		}
 		if v, ok := m["selected_id"].(string); ok {
 			c.WorkspaceSelectedID = strings.TrimSpace(v)
+		}
+		if rawMgrs, ok := m["managers"].([]any); ok {
+			c.Managers = nil
+			for _, item := range rawMgrs {
+				em, ok := item.(map[string]any)
+				if !ok {
+					continue
+				}
+				slot := ManagerSlot{
+					Enabled:       true,
+					SessionFile:   strings.TrimSpace(asStringAny(em["session_file"])),
+					MailboxesFile: strings.TrimSpace(asStringAny(em["mailboxes_file"])),
+					WorkspaceID:   strings.TrimSpace(asStringAny(em["workspace_id"])),
+					Email:         strings.TrimSpace(asStringAny(em["email"])),
+					Domain:        strings.TrimSpace(asStringAny(em["domain"])),
+					Label:         strings.TrimSpace(asStringAny(em["label"])),
+					Quota:         20,
+				}
+				if v, ok := em["enabled"].(bool); ok {
+					slot.Enabled = v
+				}
+				if v, ok := asInt(em["quota"]); ok && v > 0 {
+					slot.Quota = v
+				}
+				// Accept manager_session_file as alias
+				if slot.SessionFile == "" {
+					slot.SessionFile = strings.TrimSpace(asStringAny(em["manager_session_file"]))
+				}
+				if slot.SessionFile == "" && slot.WorkspaceID == "" {
+					continue
+				}
+				if slot.Domain == "" && slot.Email != "" {
+					slot.Domain = EmailDomain(slot.Email)
+				}
+				c.Managers = append(c.Managers, slot)
+			}
 		}
 	}
 	if m, ok := raw["import_api"].(map[string]any); ok {
@@ -384,22 +442,22 @@ func LoadProxies(path, defaultProto string) ([]string, error) {
 }
 
 // ActiveWorkspaceID returns the workspace used for join/plan checks.
-// Prefer selected_id when it exists in the pool; otherwise first id.
+// Prefer selected_id (from manager session account.id); fall back to first ids entry.
 func (c Config) ActiveWorkspaceID() string {
-	if len(c.WorkspaceIDs) == 0 {
-		return ""
-	}
 	sel := strings.TrimSpace(c.WorkspaceSelectedID)
 	if sel != "" {
-		for _, id := range c.WorkspaceIDs {
-			if strings.EqualFold(id, sel) {
-				return id
-			}
-		}
-		// selected not in list — still honor explicit selection
 		return sel
 	}
-	return c.WorkspaceIDs[0]
+	if len(c.WorkspaceIDs) > 0 {
+		return c.WorkspaceIDs[0]
+	}
+	// Multi-manager: first enabled slot with workspace id
+	for _, m := range c.Managers {
+		if m.Enabled && strings.TrimSpace(m.WorkspaceID) != "" {
+			return strings.TrimSpace(m.WorkspaceID)
+		}
+	}
+	return ""
 }
 
 // ActiveWorkspaceIDs returns a one-element slice for join/plan APIs that take []string.
@@ -411,12 +469,62 @@ func (c Config) ActiveWorkspaceIDs() []string {
 	return []string{id}
 }
 
+// ActiveManagers returns enabled manager slots. Falls back to legacy single
+// manager_session_file + selected_id when managers[] is empty.
+func (c Config) ActiveManagers() []ManagerSlot {
+	var out []ManagerSlot
+	for _, m := range c.Managers {
+		if !m.Enabled {
+			continue
+		}
+		if strings.TrimSpace(m.SessionFile) == "" && strings.TrimSpace(m.WorkspaceID) == "" {
+			continue
+		}
+		if m.Quota < 1 {
+			m.Quota = 1
+		}
+		out = append(out, m)
+	}
+	if len(out) > 0 {
+		return out
+	}
+	// Legacy single-manager shape
+	sf := strings.TrimSpace(c.ManagerSessionFile)
+	wid := strings.TrimSpace(c.WorkspaceSelectedID)
+	if wid == "" && len(c.WorkspaceIDs) > 0 {
+		wid = c.WorkspaceIDs[0]
+	}
+	if sf == "" && wid == "" {
+		return nil
+	}
+	q := c.Total
+	if q < 1 {
+		q = 1
+	}
+	return []ManagerSlot{{
+		Enabled:       true,
+		SessionFile:   sf,
+		Quota:         q,
+		MailboxesFile: "",
+		WorkspaceID:   wid,
+	}}
+}
+
+// IsPerManagerMail reports whether each manager uses its own mailboxes file.
+func (c Config) IsPerManagerMail() bool {
+	b := strings.ToLower(strings.TrimSpace(c.MailBinding))
+	return b == "per_manager" || b == "per-manager" || b == "bound"
+}
+
 func (c Config) Validate() error {
 	if c.Total < 1 {
 		return fmt.Errorf("total must be >= 1")
 	}
-	if c.WorkspaceEnabled && c.ActiveWorkspaceID() == "" {
-		return fmt.Errorf("workspace.enabled but no workspace.ids / selected_id")
+	if c.WorkspaceEnabled {
+		mgrs := c.ActiveManagers()
+		if len(mgrs) == 0 && c.ActiveWorkspaceID() == "" {
+			return fmt.Errorf("workspace.enabled but no manager session configured")
+		}
 	}
 	for _, ep := range c.ActiveImportEndpoints() {
 		if ep.AdminKey == "" {

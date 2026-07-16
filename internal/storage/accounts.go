@@ -115,15 +115,16 @@ func ensureMigrated(dataDir string) error {
 
 // AccountSummary is a lightweight row for the results table (no tokens).
 type AccountSummary struct {
-	Email             any `json:"email"`
-	PlanType          any `json:"plan_type"`
-	JoinStatus        any `json:"join_status"`
-	ApproveStatus     any `json:"approve_status"`
-	ElevateStatus     any `json:"elevate_status"`
-	ImportStatus      any `json:"import_status"`
-	ChatGPTAccountID  any `json:"chatgpt_account_id"`
-	HasAccessToken    bool `json:"has_access_token"`
-	HasRefreshToken   bool `json:"has_refresh_token"`
+	Email            any  `json:"email"`
+	PlanType         any  `json:"plan_type"`
+	JoinStatus       any  `json:"join_status"`
+	ApproveStatus    any  `json:"approve_status"`
+	ElevateStatus    any  `json:"elevate_status"`
+	ImportStatus     any  `json:"import_status"`
+	ChatGPTAccountID any  `json:"chatgpt_account_id"`
+	CreatedAt        any  `json:"created_at"`
+	HasAccessToken   bool `json:"has_access_token"`
+	HasRefreshToken  bool `json:"has_refresh_token"`
 }
 
 // LoadAccountPage reads account summaries with pagination.
@@ -231,6 +232,15 @@ func loadFromLegacyJSON(dataDir string, offset, limit int, orderDesc bool) ([]Ac
 }
 
 func summaryFromMap(a map[string]any) AccountSummary {
+	created := a["created_at"]
+	if created == nil || created == "" {
+		// legacy aliases
+		if v := a["createdAt"]; v != nil && v != "" {
+			created = v
+		} else if v := a["time"]; v != nil && v != "" {
+			created = v
+		}
+	}
 	return AccountSummary{
 		Email:            a["email"],
 		PlanType:         a["plan_type"],
@@ -239,6 +249,7 @@ func summaryFromMap(a map[string]any) AccountSummary {
 		ElevateStatus:    a["elevate_status"],
 		ImportStatus:     a["import_status"],
 		ChatGPTAccountID: a["chatgpt_account_id"],
+		CreatedAt:        created,
 		HasAccessToken:   strNonEmpty(a["access_token"]),
 		HasRefreshToken:  strNonEmpty(a["refresh_token"]),
 	}

@@ -31,6 +31,8 @@ func getEffectiveSettings(dataDir string) map[string]any {
 			"selected_id":          "",
 			"manager_session_file": "session.json",
 			"approve_requests":     true,
+			"mail_binding":         "shared",
+			"managers":             []any{},
 		},
 		"proxy": map[string]any{
 			"proxies_file":     "",
@@ -104,12 +106,39 @@ func extractCurated(ov map[string]any) map[string]any {
 				sel = strings.TrimSpace(fmt.Sprint(ids[0]))
 			}
 		}
+		managers := normalizeManagers(m["managers"])
+		// Backfill managers from legacy single session if empty
+		if len(managers) == 0 {
+			sf := orStr(asString(m["manager_session_file"]), "session.json")
+			if sf != "" || sel != "" {
+				managers = []any{map[string]any{
+					"enabled":         true,
+					"session_file":    sf,
+					"quota":           20,
+					"mailboxes_file":  "",
+					"workspace_id":    sel,
+					"email":           "",
+					"domain":          "",
+					"label":           "",
+				}}
+			}
+		}
+		if len(managers) > 0 {
+			if mm, ok := managers[0].(map[string]any); ok {
+				if sel == "" {
+					sel = asString(mm["workspace_id"])
+				}
+			}
+		}
+		mailBinding := orStr(asString(m["mail_binding"]), "shared")
 		out["workspace"] = map[string]any{
 			"enabled":              asBool(m["enabled"], true),
 			"ids":                  ids,
 			"selected_id":          sel,
 			"manager_session_file": orStr(asString(m["manager_session_file"]), "session.json"),
 			"approve_requests":     asBool(m["approve_requests"], true),
+			"mail_binding":         mailBinding,
+			"managers":             managers,
 		}
 	}
 	if m, ok := ov["proxy"].(map[string]any); ok {
@@ -239,6 +268,30 @@ func sanitizeForm(in map[string]any) map[string]any {
 		if sel == "" {
 			sel = strings.TrimSpace(asString(m["id"]))
 		}
+		managers := normalizeManagers(m["managers"])
+		// Sync legacy fields from first enabled manager for older runners / displays.
+		mgrFile := orStr(asString(m["manager_session_file"]), "session.json")
+		if len(managers) > 0 {
+			if mm, ok := managers[0].(map[string]any); ok {
+				if sf := strings.TrimSpace(asString(mm["session_file"])); sf != "" {
+					mgrFile = sf
+				}
+				if wid := strings.TrimSpace(asString(mm["workspace_id"])); wid != "" {
+					sel = wid
+				}
+			}
+			// ids = all workspace ids from managers
+			ids = []any{}
+			for _, item := range managers {
+				mm, ok := item.(map[string]any)
+				if !ok {
+					continue
+				}
+				if wid := strings.TrimSpace(asString(mm["workspace_id"])); wid != "" {
+					ids = append(ids, wid)
+				}
+			}
+		}
 		// Ensure selected is in the pool; default to first.
 		if sel != "" {
 			found := false
@@ -254,12 +307,18 @@ func sanitizeForm(in map[string]any) map[string]any {
 		} else if len(ids) > 0 {
 			sel = fmt.Sprint(ids[0])
 		}
+		mailBinding := strings.ToLower(orStr(asString(m["mail_binding"]), "shared"))
+		if mailBinding != "per_manager" && mailBinding != "shared" {
+			mailBinding = "shared"
+		}
 		out["workspace"] = map[string]any{
 			"enabled":              asBool(m["enabled"], true),
 			"ids":                  ids,
 			"selected_id":          sel,
-			"manager_session_file": orStr(asString(m["manager_session_file"]), "session.json"),
+			"manager_session_file": mgrFile,
 			"approve_requests":     asBool(m["approve_requests"], true),
+			"mail_binding":         mailBinding,
+			"managers":             managers,
 		}
 	}
 	if m, ok := in["proxy"].(map[string]any); ok {
@@ -303,6 +362,47 @@ func sanitizeForm(in map[string]any) map[string]any {
 			"wait_timeout":   wt,
 			"wait_interval":  wi,
 		}
+	}
+	return out
+}
+
+// normalizeManagers cleans workspace.managers[] entries.
+func normalizeManagers(raw any) []any {
+	list, ok := raw.([]any)
+	if !ok || len(list) == 0 {
+		return []any{}
+	}
+	out := []any{}
+	for _, item := range list {
+		em, ok := item.(map[string]any)
+		if !ok {
+			continue
+		}
+		sf := strings.TrimSpace(asString(em["session_file"]))
+		if sf == "" {
+			sf = strings.TrimSpace(asString(em["manager_session_file"]))
+		}
+		quota := asInt(em["quota"], 20)
+		if quota < 1 {
+			quota = 1
+		}
+		if quota > 10000 {
+			quota = 10000
+		}
+		entry := map[string]any{
+			"enabled":        asBool(em["enabled"], true),
+			"session_file":   sf,
+			"quota":          quota,
+			"mailboxes_file": strings.TrimSpace(asString(em["mailboxes_file"])),
+			"workspace_id":   strings.TrimSpace(asString(em["workspace_id"])),
+			"email":          strings.TrimSpace(asString(em["email"])),
+			"domain":         strings.TrimSpace(asString(em["domain"])),
+			"label":          strings.TrimSpace(asString(em["label"])),
+		}
+		if entry["session_file"] == "" && entry["workspace_id"] == "" {
+			continue
+		}
+		out = append(out, entry)
 	}
 	return out
 }

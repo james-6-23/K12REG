@@ -15,6 +15,12 @@ import (
 const (
 	UserAgent = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/145.0.0.0 Safari/537.36"
 	SecChUA   = `"Google Chrome";v="145", "Not?A_Brand";v="8", "Chromium";v="145"`
+
+	// DefaultTimeout: OpenAI / ChatGPT API calls. 90s was the main hang source
+	// when a proxy half-died mid-request.
+	DefaultTimeout = 30 * time.Second
+	// GraphTimeout: Microsoft Graph OTP polling (fail faster between polls).
+	GraphTimeout = 20 * time.Second
 )
 
 // Client wraps azuretls with cookie jar + Chrome fingerprint helpers.
@@ -28,7 +34,7 @@ func New(proxy string) (*Client, error) {
 	s := azuretls.NewSession()
 	s.Browser = azuretls.Chrome
 	s.GetClientHelloSpec = azuretls.GetBrowserClientHelloFunc(azuretls.Chrome)
-	s.SetTimeout(90 * time.Second)
+	s.SetTimeout(DefaultTimeout)
 	s.InsecureSkipVerify = true
 	s.MaxRedirects = 10
 	if proxy != "" {
@@ -37,6 +43,14 @@ func New(proxy string) (*Client, error) {
 		}
 	}
 	return &Client{Session: s, UA: UserAgent, Proxy: proxy}, nil
+}
+
+// SetTimeout overrides the per-request timeout on the underlying session.
+func (c *Client) SetTimeout(d time.Duration) {
+	if c == nil || c.Session == nil || d <= 0 {
+		return
+	}
+	c.Session.SetTimeout(d)
 }
 
 func (c *Client) Close() {

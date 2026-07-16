@@ -68,6 +68,25 @@ function download(name: string) {
   window.open('/api/download?name=' + encodeURIComponent(name), '_blank')
 }
 
+/** Format created_at for the results table. */
+function formatTime(raw?: string | null) {
+  if (!raw) return '—'
+  const s = String(raw).trim()
+  if (!s) return '—'
+  try {
+    const d = new Date(s)
+    if (Number.isNaN(d.getTime())) {
+      // already local-ish string
+      return s.length > 19 ? s.slice(0, 19).replace('T', ' ') : s
+    }
+    // YYYY-MM-DD HH:mm:ss local
+    const pad = (n: number) => String(n).padStart(2, '0')
+    return `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())} ${pad(d.getHours())}:${pad(d.getMinutes())}:${pad(d.getSeconds())}`
+  } catch {
+    return s
+  }
+}
+
 onMounted(loadAccounts)
 </script>
 
@@ -107,13 +126,14 @@ onMounted(loadAccounts)
     </div>
 
     <div class="card thin-scroll min-h-0 flex-1 overflow-auto !p-0">
-      <table class="w-full min-w-[720px]">
+      <table class="w-full min-w-[860px]">
         <thead
           class="sticky top-0 z-[1] backdrop-blur"
           style="background: color-mix(in srgb, var(--app-surface-solid) 92%, transparent)"
         >
           <tr>
             <th class="th">邮箱</th>
+            <th class="th whitespace-nowrap">时间</th>
             <th class="th">plan</th>
             <th class="th">join</th>
             <th class="th">approve</th>
@@ -126,6 +146,12 @@ onMounted(loadAccounts)
         <tbody>
           <tr v-for="(a, i) in accounts" :key="a.email || a.chatgpt_account_id || i" class="transition ui-hover">
             <td class="td font-mono text-xs font-medium ui-heading">{{ a.email || '-' }}</td>
+            <td
+              class="td whitespace-nowrap font-mono text-[11px] ui-muted"
+              :title="a.created_at || ''"
+            >
+              {{ formatTime(a.created_at) }}
+            </td>
             <td class="td">
               <span class="pill ring-1" :class="planPillCls(a.plan_type)">{{ a.plan_type || '-' }}</span>
             </td>
@@ -151,7 +177,7 @@ onMounted(loadAccounts)
             </td>
           </tr>
           <tr v-if="!accounts.length && !loading">
-            <td class="td text-center" colspan="8">
+            <td class="td text-center" colspan="9">
               <div class="py-14">
                 <p class="text-sm ui-muted">暂无账号</p>
                 <p class="mt-1 text-xs ui-faint">去「运行」页启动流水线后在此查看结果</p>

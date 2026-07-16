@@ -425,30 +425,41 @@ func isRetryableRegister(err error) bool {
 		return false
 	}
 	s := strings.ToLower(err.Error())
-	// Do not retry business / OTP errors — wastes mailbox & codes.
+	// Hard failures: already spent OTP wait or burned auth — do NOT re-run full
+	// authorize→OTP (that multiplies wall-clock by RegisterProxyRetries).
 	hard := []string{
 		"wrong code", "wrong_email_otp", "otp timeout",
-		"registration_disallowed", "user_already", "domain likely banned",
-		"turnstile.dx", "pool exhausted",
+		"validate_otp", "graph auth failed", "aadsts70000",
+		"compromised", "registration_disallowed", "user_already",
+		"domain likely banned", "turnstile.dx", "pool exhausted",
+		// Already waited full OTP window — re-running wastes another timeout.
+		"otp timeout after",
 	}
 	for _, k := range hard {
 		if strings.Contains(s, k) {
 			return false
 		}
 	}
-	// Soft / infra / flaky auth step — rotate proxy and re-run full flow
-	// (authorize PKCE → register → OTP …) from scratch.
+	// Soft / infra before OTP — rotate proxy and re-run from authorize.
+	// Note: plain "timeout" only counts as soft if not an OTP timeout (handled above).
 	keys := []string{
-		"handshake", "tls", "timeout", "connection", "eof", "reset", "proxy", "network",
+		"handshake", "tls", "connection", "eof", "reset", "proxy", "network",
+		"i/o timeout", "deadline exceeded",
 		"503", "502", "429", "cf_service", "service unavailable", "cloudflare",
 		// OpenAI auth state flake (often concurrent / sticky session issues)
 		"invalid_auth_step",
 		"invalid authorization step",
+		// authorize / register step network flake (not OTP)
+		"platform_authorize", "user_register", "sentinel req", "sentinel_req",
 	}
 	for _, k := range keys {
 		if strings.Contains(s, k) {
 			return true
 		}
+	}
+	// Generic "timeout" without otp prefix: soft (hung HTTP before OTP).
+	if strings.Contains(s, "timeout") {
+		return true
 	}
 	return false
 }

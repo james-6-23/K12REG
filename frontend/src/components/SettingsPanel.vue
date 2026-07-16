@@ -4,7 +4,9 @@ import { apiJSON } from '../api'
 import {
   defaultSettings,
   emptyImportEndpoint,
+  emptyManagerSlot,
   normalizeImportApi,
+  normalizeWorkspace,
   type DataFile,
   type Settings,
 } from '../types'
@@ -13,19 +15,33 @@ import SaveDock from './SaveDock.vue'
 import { toastError, toastSuccess } from '../toast'
 
 const settings = ref<Settings>(defaultSettings())
-const idsText = ref('')
 const dataFiles = ref<DataFile[]>([])
 const saving = ref(false)
-
-const idList = computed(() =>
-  idsText.value
-    .split(/[\n,]/)
-    .map((s) => s.trim())
-    .filter(Boolean),
-)
+/** index → parsing */
+const parsingIdx = ref<number | null>(null)
 
 const enabledImportCount = computed(
   () => settings.value.import_api.endpoints.filter((e) => e.enabled && e.url.trim()).length,
+)
+
+const managersTotalQuota = computed(() =>
+  (settings.value.workspace.managers || [])
+    .filter((m) => m.enabled)
+    .reduce((s, m) => s + (Number(m.quota) || 0), 0),
+)
+
+const managerDomains = computed(() => {
+  const set = new Set<string>()
+  for (const m of settings.value.workspace.managers || []) {
+    if (m.enabled && m.domain) set.add(m.domain.toLowerCase())
+  }
+  return [...set]
+})
+
+const domainConflict = computed(
+  () =>
+    settings.value.workspace.mail_binding === 'shared' &&
+    managerDomains.value.length > 1,
 )
 
 function isTxt(name: string) {
@@ -46,20 +62,113 @@ const proxyPoolFiles = computed(() => {
 
 const sessionFiles = computed(() => {
   return dataFiles.value.filter(
-    (f) => f.name.toLowerCase().endsWith('.json') && !f.name.startsWith('registered_accounts'),
+    (f) =>
+      f.name.toLowerCase().endsWith('.json') &&
+      !f.name.toLowerCase().startsWith('registered_accounts') &&
+      f.name.toLowerCase() !== 'settings.json' &&
+      f.name.toLowerCase() !== 'schedule.json',
   )
 })
 
-watch(idList, (list) => {
-  if (!list.length) {
-    settings.value.workspace.selected_id = ''
+function domainOfEmail(email: string) {
+  const e = (email || '').trim().toLowerCase()
+  const i = e.lastIndexOf('@')
+  return i > 0 ? e.slice(i + 1) : ''
+}
+
+/** 解析第 i 个母号 session → workspace_id / email / domain */
+async function parseManagerAt(i: number, opts?: { silent?: boolean }) {
+  const list = settings.value.workspace.managers
+  if (!list[i]) return
+  const n = (list[i].session_file || '').trim()
+  if (!n) {
+    list[i].workspace_id = ''
+    list[i].email = ''
+    list[i].domain = ''
+    syncLegacyFromManagers()
     return
   }
-  const sel = settings.value.workspace.selected_id
-  if (!sel || !list.some((id) => id.toLowerCase() === sel.toLowerCase())) {
-    settings.value.workspace.selected_id = list[0]
+  parsingIdx.value = i
+  try {
+    const text = await apiJSON<string>('/api/file?name=' + encodeURIComponent(n))
+    const raw = typeof text === 'string' ? text.trim() : JSON.stringify(text)
+    let session: unknown = raw
+    if (raw.startsWith('{')) {
+      try {
+        session = JSON.parse(raw)
+      } catch {
+        throw new Error('session 文件不是合法 JSON')
+      }
+    }
+    const data = await apiJSON<{
+      ok?: boolean
+      email?: string
+      account_id?: string
+      plan_type?: string
+      error?: string
+    }>('/api/workspace/parse-session', {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ session }),
+    })
+    list[i].workspace_id = data.account_id || ''
+    list[i].email = data.email || ''
+    list[i].domain = domainOfEmail(data.email || '')
+    syncLegacyFromManagers()
+    if (!data.account_id) {
+      if (!opts?.silent) toastError(`#${i + 1} 未找到 account.id`)
+    } else if (!opts?.silent) {
+      toastSuccess(`#${i + 1} 空间 ${data.account_id.slice(0, 8)}… · @${list[i].domain || '?'}`)
+    }
+  } catch (e) {
+    list[i].workspace_id = ''
+    list[i].email = ''
+    list[i].domain = ''
+    if (!opts?.silent) toastError(e instanceof Error ? e.message : '解析失败')
+  } finally {
+    parsingIdx.value = null
   }
-})
+}
+
+function syncLegacyFromManagers() {
+  const enabled = (settings.value.workspace.managers || []).filter((m) => m.enabled)
+  const first = enabled[0] || settings.value.workspace.managers[0]
+  if (first) {
+    settings.value.workspace.manager_session_file = first.session_file || ''
+    settings.value.workspace.selected_id = first.workspace_id || ''
+  }
+  settings.value.workspace.ids = (settings.value.workspace.managers || [])
+    .map((m) => m.workspace_id)
+    .filter(Boolean)
+}
+
+function addManager() {
+  settings.value.workspace.managers.push(emptyManagerSlot())
+}
+
+function removeManager(i: number) {
+  if (settings.value.workspace.managers.length <= 1) {
+    settings.value.workspace.managers = [emptyManagerSlot()]
+    syncLegacyFromManagers()
+    return
+  }
+  settings.value.workspace.managers.splice(i, 1)
+  syncLegacyFromManagers()
+}
+
+watch(
+  () => settings.value.workspace.managers.map((m) => m.session_file).join('|'),
+  async (cur, prev) => {
+    if (cur === prev) return
+    const files = cur.split('|')
+    const prevFiles = (prev || '').split('|')
+    for (let i = 0; i < files.length; i++) {
+      if (files[i] && files[i] !== prevFiles[i]) {
+        await parseManagerAt(i, { silent: true })
+      }
+    }
+  },
+)
 
 function addImportEndpoint() {
   const n = settings.value.import_api.endpoints.length + 1
@@ -96,28 +205,31 @@ async function loadSettings() {
     if (s.mail.wait_timeout > 300) s.mail.wait_timeout = 300
     if (!s.mail.wait_interval || s.mail.wait_interval < 0.3) s.mail.wait_interval = 1.5
     if (s.mail.wait_interval > 30) s.mail.wait_interval = 30
-    if (!s.workspace.selected_id && s.workspace.ids?.length) {
-      s.workspace.selected_id = s.workspace.ids[0]
-    }
+    s.workspace = normalizeWorkspace(s.workspace)
     settings.value = s
-    idsText.value = (s.workspace.ids || []).join('\n')
+    // 解析每个母号 session
+    for (let i = 0; i < settings.value.workspace.managers.length; i++) {
+      if (settings.value.workspace.managers[i].session_file) {
+        await parseManagerAt(i, { silent: true })
+      }
+    }
   } catch (e) {
     toastError((e as Error).message)
   }
 }
 
 async function saveSettings() {
-  settings.value.workspace.ids = idList.value
-  if (
-    settings.value.workspace.selected_id &&
-    !settings.value.workspace.ids.some(
-      (id) => id.toLowerCase() === settings.value.workspace.selected_id.toLowerCase(),
-    )
-  ) {
-    settings.value.workspace.ids = [settings.value.workspace.selected_id, ...settings.value.workspace.ids]
+  // 保存前补全未解析的 session
+  for (let i = 0; i < settings.value.workspace.managers.length; i++) {
+    const m = settings.value.workspace.managers[i]
+    if (m.enabled && m.session_file && !m.workspace_id) {
+      await parseManagerAt(i, { silent: true })
+    }
   }
-  if (!settings.value.workspace.selected_id && settings.value.workspace.ids.length) {
-    settings.value.workspace.selected_id = settings.value.workspace.ids[0]
+  syncLegacyFromManagers()
+  if (domainConflict.value) {
+    toastError('共用邮箱池模式下母号域名不一致，请统一域名或改用「每母号绑定邮箱池」')
+    return
   }
   settings.value.registration.mode = 'protocol'
   settings.value.import_api = normalizeImportApi(settings.value.import_api)
@@ -197,7 +309,7 @@ onMounted(loadSettings)
         </div>
       </div>
 
-      <!-- Workspace -->
+      <!-- Workspace summary (compact in grid) -->
       <div class="card !p-4 space-y-3">
         <div class="flex items-center justify-between gap-2">
           <div class="flex items-center gap-2.5">
@@ -208,7 +320,7 @@ onMounted(loadSettings)
             </div>
             <div>
               <h3 class="card-title">Workspace</h3>
-              <p class="hint">当前选用一个</p>
+              <p class="hint">多母号 · 每空间配额</p>
             </div>
           </div>
           <label class="toggle" title="启用">
@@ -216,45 +328,114 @@ onMounted(loadSettings)
             <span class="toggle-track"><span class="toggle-thumb" /></span>
           </label>
         </div>
-        <div>
-          <label class="label !mb-1">当前工作区</label>
-          <select
-            v-model="settings.workspace.selected_id"
-            class="field w-full !py-2 font-mono text-[11px]"
-            :disabled="!idList.length"
-          >
-            <option v-if="!idList.length" value="">先填写下方编号池</option>
-            <option v-for="id in idList" :key="id" :value="id">{{ id }}</option>
-          </select>
-        </div>
-        <div>
-          <label class="label !mb-1">编号池（每行一个）</label>
-          <textarea
-            v-model="idsText"
-            spellcheck="false"
-            class="field thin-scroll h-20 w-full resize-y font-mono text-[11px] leading-relaxed"
-            placeholder="uuid-1&#10;uuid-2"
+        <label class="flex cursor-pointer items-center gap-2 text-xs text-slate-400">
+          <input
+            v-model="settings.workspace.approve_requests"
+            type="checkbox"
+            class="h-3.5 w-3.5 rounded accent-blue-500"
           />
-        </div>
-        <div class="grid grid-cols-1 gap-2.5 sm:grid-cols-[1fr_auto] sm:items-end">
-          <div>
-            <label class="label !mb-1">母号 session</label>
-            <FileSelect
-              v-model="settings.workspace.manager_session_file"
-              :files="sessionFiles"
-              empty-text="请先上传 .json"
-              placeholder="选择 session 文件"
-            />
+          自动批准加入请求
+        </label>
+        <div>
+          <label class="label !mb-1.5">邮箱绑定</label>
+          <div class="flex flex-col gap-1.5" role="radiogroup" aria-label="邮箱绑定">
+            <button
+              type="button"
+              role="radio"
+              :aria-checked="settings.workspace.mail_binding === 'shared'"
+              class="w-full rounded-xl border px-3 py-2 text-left transition"
+              :class="
+                settings.workspace.mail_binding === 'shared'
+                  ? 'border-sky-500/50 bg-sky-500/10 ring-1 ring-sky-500/30'
+                  : 'ui-border ui-surface hover:border-sky-500/25'
+              "
+              @click="settings.workspace.mail_binding = 'shared'"
+            >
+              <div class="flex items-start gap-2">
+                <span
+                  class="mt-0.5 flex h-4 w-4 shrink-0 items-center justify-center rounded-full border"
+                  :class="
+                    settings.workspace.mail_binding === 'shared'
+                      ? 'border-sky-500 bg-sky-500 text-white'
+                      : 'ui-border'
+                  "
+                >
+                  <span
+                    v-if="settings.workspace.mail_binding === 'shared'"
+                    class="h-1.5 w-1.5 rounded-full bg-white"
+                  />
+                </span>
+                <span class="min-w-0">
+                  <span class="block text-[13px] font-medium ui-heading">共用邮箱池</span>
+                  <span class="mt-0.5 block text-[11px] leading-snug ui-faint">
+                    使用全局邮箱池 · 各母号域名须一致
+                  </span>
+                </span>
+              </div>
+            </button>
+            <button
+              type="button"
+              role="radio"
+              :aria-checked="settings.workspace.mail_binding === 'per_manager'"
+              class="w-full rounded-xl border px-3 py-2 text-left transition"
+              :class="
+                settings.workspace.mail_binding === 'per_manager'
+                  ? 'border-sky-500/50 bg-sky-500/10 ring-1 ring-sky-500/30'
+                  : 'ui-border ui-surface hover:border-sky-500/25'
+              "
+              @click="settings.workspace.mail_binding = 'per_manager'"
+            >
+              <div class="flex items-start gap-2">
+                <span
+                  class="mt-0.5 flex h-4 w-4 shrink-0 items-center justify-center rounded-full border"
+                  :class="
+                    settings.workspace.mail_binding === 'per_manager'
+                      ? 'border-sky-500 bg-sky-500 text-white'
+                      : 'ui-border'
+                  "
+                >
+                  <span
+                    v-if="settings.workspace.mail_binding === 'per_manager'"
+                    class="h-1.5 w-1.5 rounded-full bg-white"
+                  />
+                </span>
+                <span class="min-w-0">
+                  <span class="block text-[13px] font-medium ui-heading">每母号绑定邮箱池</span>
+                  <span class="mt-0.5 block text-[11px] leading-snug ui-faint">
+                    下方列表可为每个母号单独选邮箱文件
+                  </span>
+                </span>
+              </div>
+            </button>
           </div>
-          <label class="flex h-[38px] cursor-pointer items-center gap-2 text-xs text-slate-400">
-            <input
-              v-model="settings.workspace.approve_requests"
-              type="checkbox"
-              class="h-3.5 w-3.5 rounded accent-blue-500"
-            />
-            自动批准
-          </label>
         </div>
+        <div class="rounded-lg border ui-border ui-surface px-3 py-2 text-[11px] space-y-1">
+          <div>
+            <span class="ui-faint">母号数</span>
+            <strong class="ml-1.5 ui-heading">{{
+              settings.workspace.managers.filter((m) => m.enabled).length
+            }}</strong>
+          </div>
+          <div>
+            <span class="ui-faint">总配额</span>
+            <strong class="ml-1.5 ui-heading">{{ managersTotalQuota }}</strong>
+          </div>
+          <div v-if="managerDomains.length">
+            <span class="ui-faint">域名</span>
+            <span class="ml-1.5 font-mono break-all">{{
+              managerDomains.map((d) => '@' + d).join(' ')
+            }}</span>
+          </div>
+        </div>
+        <p
+          v-if="domainConflict"
+          class="text-[11px] text-rose-600 dark:text-rose-400 leading-relaxed"
+        >
+          共用邮箱池时母号域名不一致。请统一域名，或改选「每母号绑定邮箱池」。
+        </p>
+        <p class="hint leading-relaxed">
+          下方列表为各空间配置。运行时按配额依次注册并加入对应空间。
+        </p>
       </div>
 
       <!-- 代理 & 邮箱 -->
@@ -359,6 +540,115 @@ onMounted(loadSettings)
               />
             </div>
           </div>
+        </div>
+      </div>
+    </div>
+
+    <!-- 多母号空间列表 -->
+    <div class="card !p-4 space-y-3">
+      <div class="flex flex-wrap items-center gap-2">
+        <div>
+          <h3 class="card-title">母号空间列表</h3>
+          <p class="hint">
+            每个 session 对应一个工作区；配额为加入该空间的账号数。选文件后自动解析
+            <code class="text-[10px]">account.id</code>
+          </p>
+        </div>
+        <button type="button" class="btn btn-ghost btn-sm ml-auto" @click="addManager">+ 添加母号</button>
+      </div>
+
+      <div class="space-y-3">
+        <div
+          v-for="(mgr, i) in settings.workspace.managers"
+          :key="i"
+          class="rounded-xl border ui-border p-3 space-y-2.5"
+          :class="mgr.enabled ? 'ui-surface' : 'opacity-55'"
+        >
+          <div class="flex flex-wrap items-center gap-2">
+            <label class="toggle" :title="mgr.enabled ? '启用' : '禁用'">
+              <input v-model="mgr.enabled" type="checkbox" />
+              <span class="toggle-track"><span class="toggle-thumb" /></span>
+            </label>
+            <span class="text-xs font-semibold ui-muted">#{{ i + 1 }}</span>
+            <input
+              v-model="mgr.label"
+              class="field !py-1 !px-2 text-xs max-w-[10rem]"
+              placeholder="备注（可选）"
+            />
+            <div class="flex items-center gap-1.5 ml-auto">
+              <label class="text-[11px] ui-faint">配额</label>
+              <input
+                v-model.number="mgr.quota"
+                type="number"
+                min="1"
+                max="10000"
+                class="field !py-1 !px-2 w-20 text-sm"
+              />
+              <button
+                type="button"
+                class="btn btn-ghost btn-sm"
+                :disabled="parsingIdx === i || !mgr.session_file"
+                @click="parseManagerAt(i)"
+              >
+                {{ parsingIdx === i ? '解析中…' : '重新解析' }}
+              </button>
+              <button type="button" class="btn btn-ghost btn-sm text-rose-500" @click="removeManager(i)">
+                删除
+              </button>
+            </div>
+          </div>
+
+          <div
+            class="grid gap-2.5"
+            :class="
+              settings.workspace.mail_binding === 'per_manager'
+                ? 'sm:grid-cols-2'
+                : 'sm:grid-cols-1'
+            "
+          >
+            <div>
+              <label class="label !mb-1">母号 session</label>
+              <FileSelect
+                v-model="mgr.session_file"
+                :files="sessionFiles"
+                empty-text="请先上传 .json"
+                placeholder="选择 session 文件"
+              />
+            </div>
+            <div v-if="settings.workspace.mail_binding === 'per_manager'">
+              <label class="label !mb-1">绑定邮箱池</label>
+              <FileSelect
+                v-model="mgr.mailboxes_file"
+                :files="mailPoolFiles"
+                empty-text="空则用全局邮箱池"
+                placeholder="可选 · 绑定邮箱池 .txt"
+              />
+            </div>
+          </div>
+
+          <div
+            v-if="mgr.workspace_id || mgr.email"
+            class="flex flex-wrap gap-x-4 gap-y-1 text-[11px] leading-relaxed"
+          >
+            <div v-if="mgr.workspace_id">
+              <span class="ui-faint">空间</span>
+              <code class="ml-1 font-mono break-all ui-heading">{{ mgr.workspace_id }}</code>
+            </div>
+            <div v-if="mgr.email">
+              <span class="ui-faint">邮箱</span>
+              <span class="ml-1 ui-heading">{{ mgr.email }}</span>
+            </div>
+            <div v-if="mgr.domain">
+              <span class="ui-faint">域名</span>
+              <span class="ml-1 font-mono">@{{ mgr.domain }}</span>
+            </div>
+          </div>
+          <p
+            v-else-if="mgr.session_file && parsingIdx !== i"
+            class="text-[11px] text-amber-600 dark:text-amber-400"
+          >
+            未能解析空间 ID，请确认 session 含 account.id
+          </p>
         </div>
       </div>
     </div>

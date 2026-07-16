@@ -122,6 +122,8 @@ func (s *Server) routes() {
 	s.mux.HandleFunc("/api/schedule", s.handleSchedule)
 	s.mux.HandleFunc("/api/mail/pool", s.handleMailPool)
 	s.mux.HandleFunc("/api/tasks", s.handleTasks)
+	s.mux.HandleFunc("/api/workspace/join-owner", s.handleJoinOwner)
+	s.mux.HandleFunc("/api/workspace/parse-session", s.handleParseSession)
 	s.mux.HandleFunc("/", s.handleStatic)
 }
 

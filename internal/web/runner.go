@@ -12,6 +12,7 @@ import (
 	"k12reg/internal/config"
 	"k12reg/internal/mail"
 	"k12reg/internal/pipeline"
+	"k12reg/internal/workspace"
 )
 
 // RunManager runs the Go pipeline in-process and fans out logs for SSE.
@@ -202,28 +203,12 @@ func (r *RunManager) run(ctx context.Context, count *int, workspaceID, source st
 	if count != nil && *count > 0 {
 		cfg.Total = *count
 	}
-	rec.Requested = cfg.Total
 	rec.Threads = cfg.Threads
-	if workspaceID != "" {
-		cfg.WorkspaceSelectedID = workspaceID
-		// Keep selected in the pool for display consistency.
-		found := false
-		for _, id := range cfg.WorkspaceIDs {
-			if strings.EqualFold(id, workspaceID) {
-				found = true
-				break
-			}
-		}
-		if !found {
-			cfg.WorkspaceIDs = append([]string{workspaceID}, cfg.WorkspaceIDs...)
-		}
-	}
-	rec.WorkspaceID = cfg.ActiveWorkspaceID()
+
 	if cfg.SentinelVMDir == "" {
 		cfg.SentinelVMDir = os.Getenv("K12_SENTINEL_VM")
 	}
 	if cfg.SentinelVMDir == "" {
-		// default next to common deploy layout
 		for _, cand := range []string{
 			filepath.Join("scripts", "sentinel_vm"),
 			"/app/scripts/sentinel_vm",
@@ -235,30 +220,11 @@ func (r *RunManager) run(ctx context.Context, count *int, workspaceID, source st
 		}
 	}
 
-	mailFile := cfg.ResolvePath(cfg.MailboxesFile)
-	if mailFile == "" || cfg.MailboxesFile == "" {
-		// Fallback: first non-empty .txt that looks like a mail pool (any filename).
+	// Global mail fallback name
+	if cfg.MailboxesFile == "" {
 		if name := firstMailPoolFile(r.dataDir); name != "" {
-			mailFile = filepath.Join(r.dataDir, name)
 			cfg.MailboxesFile = name
 		}
-	}
-	if cfg.MailboxesFile == "" {
-		r.emit("✗ mail pool: 未配置邮箱池文件（设置里选择，或上传任意 .txt 邮箱池）")
-		code = 1
-		rec.Status = "error"
-		rec.Note = "未配置邮箱池文件"
-		return
-	}
-	rec.MailboxesFile = cfg.MailboxesFile
-	r.emit(fmt.Sprintf("· mailboxes_file=%s", cfg.MailboxesFile))
-	pool, err := mail.LoadPool(mailFile, filepath.Join(r.dataDir, "outlook_token_state.json"), cfg.AliasCount)
-	if err != nil {
-		r.emit("✗ mail pool: " + err.Error())
-		code = 1
-		rec.Status = "error"
-		rec.Note = err.Error()
-		return
 	}
 
 	var proxies []string
@@ -270,58 +236,271 @@ func (r *RunManager) run(ctx context.Context, count *int, workspaceID, source st
 		}
 	}
 
-	if cfg.WorkspaceEnabled {
-		if wid := cfg.ActiveWorkspaceID(); wid != "" {
-			r.emit(fmt.Sprintf("· workspace=%s (pool=%d)", truncID(wid, 12), len(cfg.WorkspaceIDs)))
-		} else {
-			r.emit("· workspace enabled but no selected_id / ids")
+	// Build manager slots (multi-workspace) or legacy single.
+	slots := r.resolveManagerSlots(cfg, workspaceID, count)
+	if cfg.WorkspaceEnabled && len(slots) == 0 {
+		r.emit("✗ 未配置母号 session（设置 → Workspace → 添加母号）")
+		code = 1
+		rec.Status = "error"
+		rec.Note = "未配置母号 session"
+		return
+	}
+
+	// Shared mail pool: all managers must share one domain when RequireSameDomain.
+	if cfg.WorkspaceEnabled && !cfg.IsPerManagerMail() && cfg.RequireSameDomain && len(slots) > 1 {
+		doms := map[string]struct{}{}
+		for _, s := range slots {
+			if d := strings.TrimSpace(s.Domain); d != "" {
+				doms[d] = struct{}{}
+			}
+		}
+		if len(doms) > 1 {
+			r.emit("✗ 共用邮箱池模式要求各母号邮箱域名一致；当前域名不一致，请改用「每母号绑定邮箱池」或统一母号域名")
+			for _, s := range slots {
+				r.emit(fmt.Sprintf("  · %s · @%s · %s", s.SessionFile, s.Domain, truncID(s.WorkspaceID, 12)))
+			}
+			code = 1
+			rec.Status = "error"
+			rec.Note = "母号域名不一致"
+			return
 		}
 	}
 
-	st, err := pipeline.Run(pipeline.Options{
-		Config:  cfg,
-		Proxies: proxies,
-		Pool:    pool,
-		Ctx:     ctx,
-		Log:     func(s string) { r.emit(s) },
-	})
-	rec.Registered = st.Registered
-	rec.Fail = st.Fail
-	rec.JoinOK = st.JoinOK
-	rec.ApproveOK = st.ApproveOK
-	rec.K12 = st.K12
-	rec.ImportOK = st.ImportOK
-	if err != nil {
-		if ctx.Err() != nil {
-			r.emit("⏹ 已取消")
-			code = 130
-			rec.Status = "cancelled"
-			rec.Note = "用户停止 / 取消"
+	requested := 0
+	for _, s := range slots {
+		requested += s.Quota
+	}
+	if !cfg.WorkspaceEnabled {
+		// register-only: single pass with cfg.Total
+		if requested < 1 {
+			requested = cfg.Total
+		}
+	}
+	rec.Requested = requested
+	if len(slots) > 0 {
+		rec.WorkspaceID = slots[0].WorkspaceID
+		rec.MailboxesFile = firstNonEmpty(slots[0].MailboxesFile, cfg.MailboxesFile)
+	} else {
+		rec.MailboxesFile = cfg.MailboxesFile
+	}
+
+	binding := "shared"
+	if cfg.IsPerManagerMail() {
+		binding = "per_manager"
+	}
+	r.emit(fmt.Sprintf("· managers=%d · mail_binding=%s · total_quota=%d · threads=%d",
+		len(slots), binding, requested, cfg.Threads))
+
+	statePath := filepath.Join(r.dataDir, "outlook_token_state.json")
+	var (
+		sumReg, sumFail, sumJoin, sumApprove, sumK12, sumImport int64
+	)
+
+	runOne := func(slot config.ManagerSlot, tag string) (pipeline.Stats, error) {
+		slotCfg := cfg
+		slotCfg.Total = slot.Quota
+		if slotCfg.Total < 1 {
+			slotCfg.Total = 1
+		}
+		slotCfg.ManagerSessionFile = slot.SessionFile
+		slotCfg.WorkspaceSelectedID = slot.WorkspaceID
+		slotCfg.WorkspaceIDs = nil
+		if slot.WorkspaceID != "" {
+			slotCfg.WorkspaceIDs = []string{slot.WorkspaceID}
+		}
+		mailName := strings.TrimSpace(slot.MailboxesFile)
+		if mailName == "" || !cfg.IsPerManagerMail() {
+			mailName = cfg.MailboxesFile
+		}
+		if mailName == "" {
+			return pipeline.Stats{}, fmt.Errorf("未配置邮箱池")
+		}
+		slotCfg.MailboxesFile = mailName
+		mailFile := slotCfg.ResolvePath(mailName)
+		if mailFile == "" {
+			mailFile = filepath.Join(r.dataDir, mailName)
+		}
+		pool, e := mail.LoadPool(mailFile, statePath, slotCfg.AliasCount)
+		if e != nil {
+			return pipeline.Stats{}, e
+		}
+		r.emit(fmt.Sprintf("%s mail=%s · available=%d · ws=%s · @%s · quota=%d",
+			tag, mailName, pool.Available(), truncID(slot.WorkspaceID, 12),
+			orDash(slot.Domain), slot.Quota))
+		return pipeline.Run(pipeline.Options{
+			Config:  slotCfg,
+			Proxies: proxies,
+			Pool:    pool,
+			Ctx:     ctx,
+			Log:     func(s string) { r.emit(s) },
+		})
+	}
+
+	if !cfg.WorkspaceEnabled || len(slots) == 0 {
+		// No workspace: classic single mail pool run
+		if cfg.MailboxesFile == "" {
+			r.emit("✗ mail pool: 未配置邮箱池文件")
+			code = 1
+			rec.Status = "error"
+			rec.Note = "未配置邮箱池文件"
 			return
 		}
-		r.emit("✗ pipeline: " + err.Error())
-		code = 1
-		rec.Status = "error"
-		rec.Note = err.Error()
-		return
+		st, err := runOne(config.ManagerSlot{
+			Enabled: true, Quota: cfg.Total, MailboxesFile: cfg.MailboxesFile,
+		}, "·")
+		sumReg, sumFail = st.Registered, st.Fail
+		sumJoin, sumApprove, sumK12, sumImport = st.JoinOK, st.ApproveOK, st.K12, st.ImportOK
+		if err != nil {
+			if ctx.Err() != nil {
+				r.emit("⏹ 已取消")
+				code = 130
+				rec.Status = "cancelled"
+				rec.Note = "用户停止 / 取消"
+				return
+			}
+			r.emit("✗ pipeline: " + err.Error())
+			code = 1
+			rec.Status = "error"
+			rec.Note = err.Error()
+			return
+		}
+	} else {
+		for i, slot := range slots {
+			if ctx.Err() != nil {
+				r.emit("⏹ 已取消")
+				code = 130
+				rec.Status = "cancelled"
+				rec.Note = "用户停止 / 取消"
+				return
+			}
+			tag := fmt.Sprintf("[%d/%d]", i+1, len(slots))
+			r.emit(fmt.Sprintf("── 母号 %s · %s · email=%s · quota=%d",
+				tag, slot.SessionFile, orDash(slot.Email), slot.Quota))
+			st, err := runOne(slot, tag)
+			sumReg += st.Registered
+			sumFail += st.Fail
+			sumJoin += st.JoinOK
+			sumApprove += st.ApproveOK
+			sumK12 += st.K12
+			sumImport += st.ImportOK
+			if err != nil {
+				if ctx.Err() != nil {
+					r.emit("⏹ 已取消")
+					code = 130
+					rec.Status = "cancelled"
+					rec.Note = "用户停止 / 取消"
+					return
+				}
+				r.emit(fmt.Sprintf("%s pipeline: %v", tag, err))
+				// continue other managers unless fatal cancel
+				sumFail++
+				continue
+			}
+			r.emit(fmt.Sprintf("%s done · reg=%d join=%d fail=%d",
+				tag, st.Registered, st.JoinOK, st.Fail))
+		}
 	}
+
+	rec.Registered = sumReg
+	rec.Fail = sumFail
+	rec.JoinOK = sumJoin
+	rec.ApproveOK = sumApprove
+	rec.K12 = sumK12
+	rec.ImportOK = sumImport
 	r.emit(fmt.Sprintf("── summary registered=%d join=%d k12=%d fail=%d",
-		st.Registered, st.JoinOK, st.K12, st.Fail))
-	if st.Registered == 0 && st.Fail > 0 {
+		sumReg, sumJoin, sumK12, sumFail))
+	if sumReg == 0 && sumFail > 0 {
 		code = 2
 		rec.Status = "fail"
 		rec.Note = "全部失败"
 		return
 	}
-	if st.Fail > 0 && st.Registered > 0 {
+	if sumFail > 0 && sumReg > 0 {
 		rec.Status = "ok"
 		rec.Note = "部分成功"
 		return
 	}
 	rec.Status = "ok"
-	if st.Registered == 0 && st.Fail == 0 {
+	if sumReg == 0 && sumFail == 0 {
 		rec.Note = "无任务完成"
 	}
+}
+
+// resolveManagerSlots loads session files, fills workspace id / domain, applies quota overrides.
+// count: when set, every manager uses this quota for the run.
+// workspaceID: when set, only that workspace (or single legacy override).
+func (r *RunManager) resolveManagerSlots(cfg config.Config, workspaceID string, count *int) []config.ManagerSlot {
+	raw := cfg.ActiveManagers()
+	// If request forces a single workspace id and managers empty of match, filter later.
+	var out []config.ManagerSlot
+	for _, slot := range raw {
+		sf := strings.TrimSpace(slot.SessionFile)
+		if sf != "" {
+			path := cfg.ResolvePath(sf)
+			if path == "" {
+				path = filepath.Join(r.dataDir, sf)
+			}
+			if m, e := workspace.LoadManagerSession(path); e == nil {
+				if m.AccountID != "" {
+					slot.WorkspaceID = m.AccountID
+				}
+				if m.Email != "" {
+					slot.Email = m.Email
+					slot.Domain = config.EmailDomain(m.Email)
+				}
+			} else {
+				r.emit(fmt.Sprintf("· session load %s: %v", sf, e))
+			}
+		}
+		if workspaceID != "" && slot.WorkspaceID != "" &&
+			!strings.EqualFold(slot.WorkspaceID, workspaceID) {
+			continue
+		}
+		if workspaceID != "" && slot.WorkspaceID == "" {
+			slot.WorkspaceID = workspaceID
+		}
+		if count != nil && *count > 0 {
+			slot.Quota = *count
+		}
+		if slot.Quota < 1 {
+			slot.Quota = 1
+		}
+		// per_manager: keep slot.MailboxesFile; shared: clear so runOne uses global
+		if !cfg.IsPerManagerMail() {
+			slot.MailboxesFile = ""
+		}
+		out = append(out, slot)
+	}
+	// Explicit single workspace + no managers matched: synthesize one slot
+	if len(out) == 0 && workspaceID != "" {
+		q := cfg.Total
+		if count != nil && *count > 0 {
+			q = *count
+		}
+		out = append(out, config.ManagerSlot{
+			Enabled:       true,
+			SessionFile:   cfg.ManagerSessionFile,
+			Quota:         q,
+			WorkspaceID:   workspaceID,
+			MailboxesFile: "",
+		})
+	}
+	return out
+}
+
+func firstNonEmpty(a, b string) string {
+	if strings.TrimSpace(a) != "" {
+		return a
+	}
+	return b
+}
+
+func orDash(s string) string {
+	s = strings.TrimSpace(s)
+	if s == "" {
+		return "—"
+	}
+	return s
 }
 
 func truncID(s string, n int) string {

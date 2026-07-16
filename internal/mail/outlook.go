@@ -279,7 +279,7 @@ func (p *Pool) saveState() {
 	_ = os.WriteFile(p.statePath, append(b, '\n'), 0o644)
 }
 
-// Acquire next available mailbox.
+// Acquire next available mailbox (front-to-back, sequential).
 func (p *Pool) Acquire() (Mailbox, error) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
@@ -295,11 +295,36 @@ func (p *Pool) Acquire() (Mailbox, error) {
 		p.saveState()
 		return mb, nil
 	}
+	return Mailbox{}, p.exhaustedErr()
+}
+
+// AcquireFromEnd takes the last free mailbox in the pool file order
+// (end of hotmail.txt first). Used by one-shot flows that should burn
+// stock from the tail without aliases.
+func (p *Pool) AcquireFromEnd() (Mailbox, error) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	for i := len(p.items) - 1; i >= 0; i-- {
+		mb := p.items[i]
+		if !p.entryUsableLocked(mb) {
+			continue
+		}
+		key := strings.ToLower(mb.Address)
+		p.state[key] = "in_use"
+		// Keep sequential index consistent if mixed with Acquire later.
+		p.index = i
+		p.saveState()
+		return mb, nil
+	}
+	return Mailbox{}, p.exhaustedErr()
+}
+
+func (p *Pool) exhaustedErr() error {
 	msg := fmt.Sprintf("outlook pool exhausted (%d entries)", len(p.items))
 	if p.requireDomain != "" {
 		msg += fmt.Sprintf(" for domain @%s", p.requireDomain)
 	}
-	return Mailbox{}, fmt.Errorf("%s", msg)
+	return fmt.Errorf("%s", msg)
 }
 
 func (p *Pool) Mark(mb Mailbox, success bool) {
@@ -492,10 +517,8 @@ func WaitForCode(ctx context.Context, mb Mailbox, timeout, interval time.Duratio
 		return "", err
 	}
 	defer client.Close()
-	// Shorter per-request timeout so Stop doesn't wait up to 90s on a hung Graph call.
-	if client.Session != nil {
-		client.Session.SetTimeout(20 * time.Second)
-	}
+	// Graph polls: fail faster than default OpenAI timeout.
+	client.SetTimeout(httpx.GraphTimeout)
 	// Abort in-flight Graph HTTP as soon as Stop cancels ctx.
 	if stop := context.AfterFunc(ctx, func() { client.Close() }); stop != nil {
 		defer stop()

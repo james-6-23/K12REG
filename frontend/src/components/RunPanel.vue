@@ -13,20 +13,39 @@ const emit = defineEmits<{
 
 const count = ref('')
 const workspaceId = ref('')
-const workspacePool = ref<string[]>([])
 const workspaceEnabled = ref(true)
+const managerSessionFile = ref('')
+const mailBinding = ref<'shared' | 'per_manager'>('shared')
+const managerSlots = ref<
+  { session_file: string; quota: number; workspace_id: string; email: string; domain: string; enabled: boolean }[]
+>([])
 const autoscroll = ref(true)
 const logEl = ref<HTMLDivElement | null>(null)
 let logSource: EventSource | null = null
 
-const hasWorkspaceChoices = computed(() => workspaceEnabled.value && workspacePool.value.length > 0)
+const showWorkspace = computed(
+  () => workspaceEnabled.value && (managerSlots.value.length > 0 || !!workspaceId.value),
+)
+const totalQuota = computed(() =>
+  managerSlots.value.filter((m) => m.enabled).reduce((s, m) => s + (m.quota || 0), 0),
+)
 
 async function loadWorkspace() {
   try {
     const s = await apiJSON<Settings>('/api/settings')
     workspaceEnabled.value = !!s.workspace?.enabled
-    workspacePool.value = s.workspace?.ids || []
-    workspaceId.value = s.workspace?.selected_id || workspacePool.value[0] || ''
+    managerSessionFile.value = (s.workspace?.manager_session_file || '').trim()
+    mailBinding.value = s.workspace?.mail_binding === 'per_manager' ? 'per_manager' : 'shared'
+    const mgrs = s.workspace?.managers || []
+    managerSlots.value = mgrs.map((m) => ({
+      enabled: m.enabled !== false,
+      session_file: m.session_file || '',
+      quota: m.quota || 20,
+      workspace_id: m.workspace_id || '',
+      email: m.email || '',
+      domain: m.domain || '',
+    }))
+    workspaceId.value = (s.workspace?.selected_id || managerSlots.value[0]?.workspace_id || '').trim()
   } catch {
     /* ignore */
   }
@@ -164,23 +183,42 @@ watch(
         </div>
       </div>
 
-      <!-- Full-width workspace selector so UUID is never truncated -->
+      <!-- 多母号工作区摘要 -->
       <div
-        v-if="hasWorkspaceChoices"
-        class="flex min-w-0 items-center gap-2 border-t border-white/[0.05] pt-2"
+        v-if="showWorkspace"
+        class="min-w-0 space-y-1.5 border-t border-white/[0.05] pt-2"
       >
-        <label class="shrink-0 text-xs text-slate-500">工作区</label>
-        <select
-          v-model="workspaceId"
-          class="field min-w-0 flex-1 !py-1.5 font-mono text-[12px] leading-snug"
-          :disabled="runStatus.running"
-          :title="workspaceId"
+        <div class="flex flex-wrap items-center gap-2 text-xs text-slate-500">
+          <span>工作区</span>
+          <span class="rounded bg-white/5 px-1.5 py-0.5 font-mono text-[10px]">
+            {{ managerSlots.filter((m) => m.enabled).length || 1 }} 个 · 配额
+            {{ totalQuota || '—' }} ·
+            {{ mailBinding === 'per_manager' ? '每母号邮箱池' : '共用邮箱池' }}
+          </span>
+        </div>
+        <div
+          v-if="managerSlots.length"
+          class="max-h-24 overflow-y-auto space-y-1 text-[11px] font-mono leading-snug"
         >
-          <option v-for="id in workspacePool" :key="id" :value="id">{{ id }}</option>
-        </select>
-        <span class="hidden shrink-0 text-[10px] text-slate-600 sm:inline">
-          {{ workspacePool.length }} 个
-        </span>
+          <div
+            v-for="(m, i) in managerSlots.filter((x) => x.enabled)"
+            :key="i"
+            class="flex min-w-0 flex-wrap gap-x-2 gap-y-0.5 text-slate-400"
+          >
+            <span class="text-slate-500">#{{ i + 1 }}</span>
+            <span class="ui-heading">{{ m.session_file || '—' }}</span>
+            <span>×{{ m.quota }}</span>
+            <span v-if="m.domain">@{{ m.domain }}</span>
+            <span v-if="m.workspace_id" class="truncate opacity-80" :title="m.workspace_id">
+              {{ m.workspace_id.slice(0, 8) }}…
+            </span>
+          </div>
+        </div>
+        <code
+          v-else-if="workspaceId"
+          class="field block min-w-0 !py-1.5 font-mono text-[12px] leading-snug break-all ui-heading"
+          :title="workspaceId"
+        >{{ workspaceId }}</code>
       </div>
     </div>
 

@@ -2,6 +2,7 @@ package sentinel
 
 import (
 	"bytes"
+	"context"
 	"crypto/rand"
 	"encoding/base64"
 	"encoding/json"
@@ -306,7 +307,10 @@ func solveDX(dx, secret, ua, vmDir string) string {
 		"locationHref":   "https://auth.openai.com/",
 		"timeoutMs":      4000,
 	})
-	cmd := exec.Command(node, runner)
+	// Hard cap Node process so a hung VM never freezes the worker indefinitely.
+	ctx, cancel := context.WithTimeout(context.Background(), 8*time.Second)
+	defer cancel()
+	cmd := exec.CommandContext(ctx, node, runner)
 	cmd.Dir = vmDir
 	cmd.Stdin = bytes.NewReader(payload)
 	var stdout, stderr bytes.Buffer

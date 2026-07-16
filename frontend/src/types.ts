@@ -6,6 +6,7 @@ export type TabId =
   | 'tasks'
   | 'results'
   | 'schedule'
+  | 'join-owner'
   | 'advanced'
 
 export interface TaskRecord {
@@ -103,14 +104,42 @@ export interface RegistrationSettings {
   pipeline_gate: string
 }
 
+/** One mother session / workspace slot. */
+export interface ManagerSlot {
+  enabled: boolean
+  /** Session JSON in data dir, e.g. session.json */
+  session_file: string
+  /** How many accounts to register+join into this workspace. */
+  quota: number
+  /**
+   * Optional mail pool for this manager when mail_binding=per_manager.
+   * Empty → use global mail.mailboxes_file.
+   */
+  mailboxes_file: string
+  /** Parsed from session account.id */
+  workspace_id: string
+  email: string
+  domain: string
+  label: string
+}
+
 export interface WorkspaceSettings {
   enabled: boolean
-  /** Pool of workspace UUIDs (for switching). */
+  /**
+   * Legacy: all workspace UUIDs (synced from managers on save).
+   */
   ids: string[]
-  /** The one used for join/plan on each run. */
+  /** Legacy primary workspace id (first manager). */
   selected_id: string
+  /** Legacy single manager session file (first manager). */
   manager_session_file: string
   approve_requests: boolean
+  /**
+   * shared = one global mail pool (all managers must share email domain);
+   * per_manager = each manager may bind its own mailboxes_file.
+   */
+  mail_binding: 'shared' | 'per_manager'
+  managers: ManagerSlot[]
 }
 
 export interface ProxySettings {
@@ -154,6 +183,8 @@ export interface AccountRow {
   elevate_status: string | null
   import_status: string | null
   chatgpt_account_id: string | null
+  /** ISO time from registration, e.g. 2026-07-16T08:12:33Z */
+  created_at?: string | null
   has_access_token: boolean
   has_refresh_token?: boolean
 }
@@ -165,6 +196,67 @@ export function emptyImportEndpoint(i = 1): ImportEndpoint {
     url: '',
     admin_key: '',
     require_k12: true,
+  }
+}
+
+export function emptyManagerSlot(): ManagerSlot {
+  return {
+    enabled: true,
+    session_file: '',
+    quota: 20,
+    mailboxes_file: '',
+    workspace_id: '',
+    email: '',
+    domain: '',
+    label: '',
+  }
+}
+
+export function normalizeWorkspace(raw: unknown): WorkspaceSettings {
+  const m = (raw || {}) as Record<string, unknown>
+  const mailBinding =
+    m.mail_binding === 'per_manager' ? 'per_manager' : 'shared'
+  let managers: ManagerSlot[] = []
+  if (Array.isArray(m.managers)) {
+    for (const item of m.managers) {
+      const em = (item || {}) as Record<string, unknown>
+      const sf = String(em.session_file || em.manager_session_file || '').trim()
+      const quota = Math.max(1, Number(em.quota) || 20)
+      managers.push({
+        enabled: em.enabled !== false,
+        session_file: sf,
+        quota,
+        mailboxes_file: String(em.mailboxes_file || '').trim(),
+        workspace_id: String(em.workspace_id || '').trim(),
+        email: String(em.email || '').trim(),
+        domain: String(em.domain || '').trim(),
+        label: String(em.label || '').trim(),
+      })
+    }
+  }
+  if (!managers.length) {
+    const sf = String(m.manager_session_file || 'session.json').trim()
+    managers = [
+      {
+        ...emptyManagerSlot(),
+        session_file: sf,
+        workspace_id: String(m.selected_id || '').trim(),
+      },
+    ]
+  }
+  const ids = Array.isArray(m.ids)
+    ? (m.ids as unknown[]).map((x) => String(x).trim()).filter(Boolean)
+    : managers.map((x) => x.workspace_id).filter(Boolean)
+  return {
+    enabled: m.enabled !== false,
+    ids,
+    selected_id: String(m.selected_id || managers[0]?.workspace_id || ''),
+    manager_session_file: String(
+      m.manager_session_file || managers[0]?.session_file || 'session.json',
+    ),
+    approve_requests: m.approve_requests !== false,
+    mail_binding: mailBinding,
+    managers,
   }
 }
 
@@ -181,6 +273,8 @@ export function defaultSettings(): Settings {
       selected_id: '',
       manager_session_file: 'session.json',
       approve_requests: true,
+      mail_binding: 'shared',
+      managers: [emptyManagerSlot()],
     },
     proxy: { proxies_file: '', default_protocol: 'socks5', flaresolverr_url: '' },
     mail: { mailboxes_file: '', alias_count: 1, wait_timeout: 30, wait_interval: 1.5 },

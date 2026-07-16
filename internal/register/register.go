@@ -87,6 +87,8 @@ func Run(opt Options) (*Result, error) {
 		return nil, err
 	}
 	defer client.Close()
+	// 30s per request (was 90s) — proxy half-open no longer freezes a whole worker.
+	client.SetTimeout(httpx.DefaultTimeout)
 	// Stop button cancels ctx → close TLS session to abort hung OpenAI/Graph HTTP.
 	if stop := context.AfterFunc(opt.ctx(), func() { client.Close() }); stop != nil {
 		defer stop()

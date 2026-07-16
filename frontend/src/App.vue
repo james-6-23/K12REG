@@ -13,6 +13,7 @@ import MailPoolPanel from './components/MailPoolPanel.vue'
 import TasksPanel from './components/TasksPanel.vue'
 import ResultsPanel from './components/ResultsPanel.vue'
 import SchedulePanel from './components/SchedulePanel.vue'
+import JoinOwnerPanel from './components/JoinOwnerPanel.vue'
 import ToastHost from './components/ToastHost.vue'
 
 const authed = ref(false)
@@ -27,6 +28,7 @@ const tabs: TabItem[] = [
   { id: 'tasks', label: '任务记录' },
   { id: 'results', label: '结果' },
   { id: 'schedule', label: '定时' },
+  { id: 'join-owner', label: '加入 Owner' },
   { id: 'advanced', label: '高级' },
 ]
 
@@ -38,6 +40,10 @@ const pageMeta: Record<TabId, { title: string; desc: string }> = {
   tasks: { title: '任务记录', desc: '手动 / 定时运行历史与注册成功失败统计' },
   results: { title: '结果', desc: '已注册账号与下载产物' },
   schedule: { title: '定时任务', desc: '按间隔或每天固定时间自动启动流水线' },
+  'join-owner': {
+    title: '加入 Owner',
+    desc: '粘贴母号 / 目标 session，申请加入空间并可设为 owner',
+  },
   advanced: { title: '高级', desc: '直接编辑 settings.json 覆盖层' },
 }
 
@@ -50,6 +56,7 @@ const fillPage = computed(
     tab.value === 'mail' ||
     tab.value === 'tasks' ||
     tab.value === 'results' ||
+    tab.value === 'join-owner' ||
     tab.value === 'advanced',
 )
 
@@ -155,6 +162,7 @@ onBeforeUnmount(stopStatusTimer)
           <TasksPanel v-else-if="tab === 'tasks'" />
           <ResultsPanel v-else-if="tab === 'results'" />
           <SchedulePanel v-else-if="tab === 'schedule'" />
+          <JoinOwnerPanel v-else-if="tab === 'join-owner'" />
           <AdvancedPanel v-else-if="tab === 'advanced'" />
         </div>
       </main>

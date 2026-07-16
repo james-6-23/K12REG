@@ -5,8 +5,11 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strings"
 	"sync"
 	"time"
+
+	"k12reg/internal/config"
 )
 
 const scheduleFile = "schedule.json"
@@ -162,14 +165,23 @@ func (s *Scheduler) tick(now time.Time) {
 	_ = saveSchedule(s.dataDir, s.cfg)
 	s.mu.Unlock()
 
-	s.runner.emit(fmt.Sprintf("⏰ 定时任务触发 · mode=%s", cfg.Mode))
-
 	var count *int
 	reqN := 0
 	if cfg.Count != nil && *cfg.Count > 0 {
 		c := *cfg.Count
 		count = &c
 		reqN = c
+	}
+
+	// Preview multi-manager plan from current settings (same path as manual run).
+	mgrNote := "settings managers"
+	if st, err := loadSettingsManagersPreview(s.dataDir, count); err == nil {
+		mgrNote = st
+	}
+	if count != nil {
+		s.runner.emit(fmt.Sprintf("⏰ 定时任务触发 · mode=%s · 每母号配额覆盖=%d · %s", cfg.Mode, *count, mgrNote))
+	} else {
+		s.runner.emit(fmt.Sprintf("⏰ 定时任务触发 · mode=%s · 使用各母号配额 · %s", cfg.Mode, mgrNote))
 	}
 
 	if cfg.SkipIfRunning {
@@ -191,6 +203,7 @@ func (s *Scheduler) tick(now time.Time) {
 		}
 	}
 
+	// workspaceID "" → runner 使用设置中全部启用母号（多空间）
 	if err := s.runner.Start(count, "", "schedule"); err != nil {
 		s.note(false, err.Error())
 		s.runner.emit("⏰ 定时启动失败: " + err.Error())
@@ -206,7 +219,7 @@ func (s *Scheduler) tick(now time.Time) {
 		})
 		return
 	}
-	s.note(true, "已启动")
+	s.note(true, "已启动 · "+mgrNote)
 }
 
 func (s *Scheduler) shouldFire(now time.Time, cfg ScheduleConfig) (bool, string) {
@@ -312,6 +325,43 @@ func (s *Scheduler) recomputeNextLocked() {
 			s.cfg.NextRunAt = last.Add(iv).Format(time.RFC3339)
 		}
 	}
+}
+
+// loadSettingsManagersPreview summarizes multi-manager plan for schedule logs.
+// count non-nil → each manager quota overridden.
+func loadSettingsManagersPreview(dataDir string, count *int) (string, error) {
+	cfg, err := config.LoadJSON(filepath.Join(dataDir, settingsFile))
+	if err != nil {
+		cfg = config.Default()
+	}
+	cfg.DataDir = dataDir
+	mgrs := cfg.ActiveManagers()
+	if len(mgrs) == 0 {
+		return "no managers", nil
+	}
+	total := 0
+	parts := make([]string, 0, len(mgrs))
+	for i, m := range mgrs {
+		q := m.Quota
+		if count != nil && *count > 0 {
+			q = *count
+		}
+		if q < 1 {
+			q = 1
+		}
+		total += q
+		name := strings.TrimSpace(m.SessionFile)
+		if name == "" {
+			name = truncID(m.WorkspaceID, 8)
+		}
+		parts = append(parts, fmt.Sprintf("#%d %s×%d", i+1, name, q))
+	}
+	binding := "shared"
+	if cfg.IsPerManagerMail() {
+		binding = "per_manager"
+	}
+	return fmt.Sprintf("managers=%d · %s · total≈%d · %s",
+		len(mgrs), binding, total, strings.Join(parts, ", ")), nil
 }
 
 func loadSchedule(dataDir string) ScheduleConfig {

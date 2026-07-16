@@ -30,6 +30,7 @@ func Join(accessToken, workspaceID, route, proxy string) JoinResult {
 		return JoinResult{WorkspaceID: workspaceID, Error: err.Error()}
 	}
 	defer client.Close()
+	client.SetTimeout(httpx.DefaultTimeout)
 
 	deviceID := randomID()
 	u := fmt.Sprintf("%s/backend-api/accounts/%s/invites/%s", ChatGPTBase, workspaceID, route)
@@ -44,11 +45,14 @@ func Join(accessToken, workspaceID, route, proxy string) JoinResult {
 		"user-agent":      httpx.UserAgent,
 	}
 	var last JoinResult
+	// 3 tries, short backoff (1s/2s) — avoid multi-minute freezes on bad proxy.
 	for attempt := 0; attempt < 3; attempt++ {
 		resp, err := client.Post(u, []byte(""), headers, false)
 		if err != nil {
 			last = JoinResult{WorkspaceID: workspaceID, Error: err.Error()}
-			time.Sleep(time.Duration(attempt+1) * 2 * time.Second)
+			if attempt < 2 {
+				time.Sleep(time.Duration(attempt+1) * time.Second)
+			}
 			continue
 		}
 		body := httpx.DumpSnippet(resp.Body, 400)
@@ -68,7 +72,9 @@ func Join(accessToken, workspaceID, route, proxy string) JoinResult {
 		if resp.StatusCode == 401 || resp.StatusCode == 403 {
 			return last
 		}
-		time.Sleep(time.Duration(attempt+1) * 2 * time.Second)
+		if attempt < 2 {
+			time.Sleep(time.Duration(attempt+1) * time.Second)
+		}
 	}
 	return last
 }
@@ -156,6 +162,9 @@ func RefreshAccessToken(refreshToken, proxy string) (accessToken string, err err
 // ApproveByEmail lists pending requests and accepts the matching invite.
 func ApproveByEmail(mgr ManagerSession, email, proxy string, maxAttempts int) error {
 	if maxAttempts < 1 {
+		maxAttempts = 8
+	}
+	if maxAttempts > 12 {
 		maxAttempts = 12
 	}
 	client, err := httpx.New(proxy)
@@ -163,6 +172,7 @@ func ApproveByEmail(mgr ManagerSession, email, proxy string, maxAttempts int) er
 		return err
 	}
 	defer client.Close()
+	client.SetTimeout(httpx.DefaultTimeout)
 	email = strings.ToLower(strings.TrimSpace(email))
 	accountID := mgr.AccountID
 	if accountID == "" {
@@ -193,9 +203,22 @@ func ApproveByEmail(mgr ManagerSession, email, proxy string, maxAttempts int) er
 				return nil
 			}
 		}
-		time.Sleep(time.Duration(2+attempt) * time.Second)
+		// Cap wait: 1.5s → 3s (was 2+attempt up to 13s each → ~90s pure sleep).
+		if attempt+1 < maxAttempts {
+			time.Sleep(approveBackoff(attempt))
+		}
 	}
 	return fmt.Errorf("approve timeout for %s", email)
+}
+
+// approveBackoff: short, capped delays between invite list polls.
+func approveBackoff(attempt int) time.Duration {
+	// 1.5s, 2s, 2.5s, 3s, 3s, …
+	d := 1500*time.Millisecond + time.Duration(attempt)*500*time.Millisecond
+	if d > 3*time.Second {
+		d = 3 * time.Second
+	}
+	return d
 }
 
 func aliasMatch(a, b string) bool {
