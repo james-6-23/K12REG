@@ -71,7 +71,7 @@ func (p *Pool) Available() int {
 	return n
 }
 
-// entryUsableLocked: address free AND base not dead (used / token_invalid).
+// entryUsableLocked: address free AND base not Graph-dead / fully burned.
 func (p *Pool) entryUsableLocked(mb Mailbox) bool {
 	key := strings.ToLower(mb.Address)
 	st := p.state[key]
@@ -82,15 +82,43 @@ func (p *Pool) entryUsableLocked(mb Mailbox) bool {
 	if base == "" {
 		base = key
 	}
-	// Base consumed or Graph-dead → skip all plus-aliases of this inbox.
+	// Only Graph-dead / explicit base burn blocks all aliases.
+	// Per-alias success no longer sets base=used (see Mark).
 	switch p.state[base] {
-	case "used", "token_invalid", "failed":
+	case "used", "token_invalid":
 		return false
 	}
 	if p.requireDomain != "" && emailDomain(mb.Address) != p.requireDomain {
 		return false
 	}
 	return true
+}
+
+func mailboxBase(mb Mailbox) string {
+	base := strings.ToLower(strings.TrimSpace(mb.BaseEmail))
+	if base == "" {
+		return strings.ToLower(strings.TrimSpace(mb.Address))
+	}
+	return base
+}
+
+// baseBusyLocked is true if any alias of this base is currently in_use
+// (another worker is mid-registration on the same Graph inbox).
+func (p *Pool) baseBusyLocked(base string) bool {
+	base = strings.ToLower(strings.TrimSpace(base))
+	if base == "" {
+		return false
+	}
+	for _, item := range p.items {
+		if mailboxBase(item) != base {
+			continue
+		}
+		if p.state[strings.ToLower(item.Address)] == "in_use" {
+			return true
+		}
+	}
+	// Base itself may be marked in_use in edge cases.
+	return p.state[base] == "in_use"
 }
 
 func emailDomain(email string) string {
@@ -279,23 +307,51 @@ func (p *Pool) saveState() {
 	_ = os.WriteFile(p.statePath, append(b, '\n'), 0o644)
 }
 
-// Acquire next available mailbox (front-to-back, sequential).
+// Acquire next available mailbox.
+//
+// Preference (for high concurrency + plus-aliases):
+//  1. Free alias whose base has NO other in_use worker (different Graph inbox).
+//     e.g. 20 threads → 20 different base prefixes when stock allows.
+//  2. Else any free alias (may share a base only when all free bases are busy).
+//
+// Scan still walks pool order so stock is consumed somewhat evenly.
 func (p *Pool) Acquire() (Mailbox, error) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
-	for i := 0; i < len(p.items); i++ {
-		idx := (p.index + i) % len(p.items)
+
+	// Pass 1: prefer bases that are not currently busy (spread across inboxes).
+	if mb, ok := p.acquirePassLocked(true); ok {
+		return mb, nil
+	}
+	// Pass 2: any free alias (fallback when concurrent > free bases).
+	if mb, ok := p.acquirePassLocked(false); ok {
+		return mb, nil
+	}
+	return Mailbox{}, p.exhaustedErr()
+}
+
+// preferIdleBase: only take aliases of bases with zero in_use siblings.
+func (p *Pool) acquirePassLocked(preferIdleBase bool) (Mailbox, bool) {
+	n := len(p.items)
+	if n == 0 {
+		return Mailbox{}, false
+	}
+	for i := 0; i < n; i++ {
+		idx := (p.index + i) % n
 		mb := p.items[idx]
 		if !p.entryUsableLocked(mb) {
+			continue
+		}
+		if preferIdleBase && p.baseBusyLocked(mailboxBase(mb)) {
 			continue
 		}
 		key := strings.ToLower(mb.Address)
 		p.state[key] = "in_use"
 		p.index = idx + 1
 		p.saveState()
-		return mb, nil
+		return mb, true
 	}
-	return Mailbox{}, p.exhaustedErr()
+	return Mailbox{}, false
 }
 
 // AcquireFromEnd takes the last free mailbox in the pool file order
@@ -331,28 +387,20 @@ func (p *Pool) Mark(mb Mailbox, success bool) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	key := strings.ToLower(mb.Address)
-	base := strings.ToLower(strings.TrimSpace(mb.BaseEmail))
-	if base == "" {
-		base = key
-	}
-	// Join-owner / burn stock: always treat as used so the same line is never
-	// handed out again (failed also burns — pool is one-shot per address).
-	st := "used"
+	base := mailboxBase(mb)
 	if !success {
-		// Keep distinct status for stats, but base is still blocked via entryUsable.
-		st = "failed"
-	}
-	p.state[key] = st
-	// Block the whole base inbox (aliases + re-acquire of base).
-	if success || p.state[base] != "used" {
-		if success {
-			p.state[base] = "used"
-		} else if p.state[base] == "" || p.state[base] == "in_use" || p.state[base] == "failed" {
-			// failed base still unusable (entryUsable treats failed as dead)
-			p.state[base] = "failed"
+		// Soft-fail: free this alias only (sibling aliases unaffected).
+		if p.state[key] == "in_use" || p.state[key] == "failed" {
+			delete(p.state, key)
 		}
+		p.saveState()
+		return
 	}
+	// Success: burn this alias only — other plus-aliases of the same base stay usable.
+	// (Graph-dead still burns whole base via MarkGraphDead.)
+	p.state[key] = "used"
 	p.saveState()
+	_ = base // base no longer auto-burned on success
 }
 
 // SeedUsed marks emails as used without acquiring (e.g. already have session

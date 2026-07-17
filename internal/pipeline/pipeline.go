@@ -150,14 +150,14 @@ func Run(opt Options) (stats Stats, err error) {
 					opt.log("%s cancelled", tag)
 					return
 				}
-				// Bad Graph refresh_token / compromised / already-used stock:
-				// mark base + aliases as used so they are not picked again.
+				// Graph token permanently dead → burn stock (cannot OTP again).
+				// Other register fails → free mailbox (do NOT mark used).
 				if mail.IsGraphAuthPermanent(regErr) {
 					opt.Pool.MarkGraphDead(mb)
 					opt.log("%s REGISTER FAIL (graph dead · marked used): %v", tag, regErr)
 				} else {
-					opt.Pool.Mark(mb, false)
-					opt.log("%s REGISTER FAIL: %v", tag, regErr)
+					opt.Pool.Mark(mb, false) // release in_use / failed → free again
+					opt.log("%s REGISTER FAIL (mailbox freed, not used): %v", tag, regErr)
 				}
 				atomic.AddInt64(&stats.Fail, 1)
 				continue
@@ -556,7 +556,7 @@ func isRetryableRegister(err error) bool {
 	// authorize→OTP (that multiplies wall-clock by RegisterProxyRetries).
 	hard := []string{
 		"wrong code", "wrong_email_otp", "otp timeout",
-		"validate_otp", "graph auth failed", "aadsts70000",
+		"graph auth failed", "aadsts70000",
 		"compromised", "registration_disallowed", "user_already",
 		"domain likely banned", "turnstile.dx", "pool exhausted",
 		// Already waited full OTP window — re-running wastes another timeout.
@@ -566,6 +566,12 @@ func isRetryableRegister(err error) bool {
 		if strings.Contains(s, k) {
 			return false
 		}
+	}
+	// validate 409 invalid_state is often sticky-session flake — allow proxy/re-auth retry.
+	// Other validate_otp (wrong code etc.) already covered above or treated soft only if network.
+	if strings.Contains(s, "validate_otp") && !strings.Contains(s, "invalid_state") &&
+		!strings.Contains(s, "session is no longer valid") {
+		return false
 	}
 	// Soft / infra before OTP — rotate proxy and re-run from authorize.
 	// Note: plain "timeout" only counts as soft if not an OTP timeout (handled above).

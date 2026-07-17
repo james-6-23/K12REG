@@ -13,8 +13,11 @@ import (
 )
 
 const (
+	// Keep UA / Client Hints aligned with azuretls Chrome profile + Sentinel config.
 	UserAgent = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/145.0.0.0 Safari/537.36"
 	SecChUA   = `"Google Chrome";v="145", "Not?A_Brand";v="8", "Chromium";v="145"`
+	// Accept-Language matches sentinel Generator locale (en-US).
+	AcceptLanguage = "en-US,en;q=0.9"
 
 	// DefaultTimeout: OpenAI / ChatGPT API calls. 90s was the main hang source
 	// when a proxy half-died mid-request.
@@ -157,7 +160,7 @@ func (c *Client) Do(method, rawURL string, body []byte, headers map[string]strin
 	// Emit caller headers first (dedupe case-insensitive), then browser baseline.
 	base := map[string]string{
 		"User-Agent":         c.UA,
-		"Accept-Language":    "en-US,en;q=0.9",
+		"Accept-Language":    AcceptLanguage,
 		"Accept-Encoding":    "gzip, deflate, br",
 		"sec-ch-ua":          SecChUA,
 		"sec-ch-ua-mobile":   "?0",

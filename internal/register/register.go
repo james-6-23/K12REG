@@ -126,7 +126,8 @@ func Run(opt Options) (*Result, error) {
 	}
 }
 
-// runChatGPTWeb: ChatGPT Web client + NextAuth session (Proxyman-aligned).
+// runChatGPTWeb: passwordless ChatGPT Web signup (Proxyman-aligned) + NextAuth session.
+// Flow: signin/openai → authorize → OTP → create_account → callback → /api/auth/session.
 func runChatGPTWeb(opt Options) (*Result, error) {
 	if err := opt.errIfDone(); err != nil {
 		return nil, err
@@ -142,17 +143,16 @@ func runChatGPTWeb(opt Options) (*Result, error) {
 	}
 
 	deviceID := randomUUID()
-	for _, dom := range []string{"auth.openai.com", ".auth.openai.com", "chatgpt.com", ".chatgpt.com"} {
+	for _, dom := range []string{"auth.openai.com", ".auth.openai.com", "chatgpt.com", ".chatgpt.com", "openai.com", ".openai.com"} {
 		client.SetCookie("oai-did", deviceID, dom)
 	}
 
-	// Optional password (legacy re-login). Web capture is passwordless; we still
-	// try password register first, then fall back to passwordless OTP signup.
-	password := randomPassword(16)
 	first, last := randomName()
 	email := opt.Mailbox.Address
+	// Passwordless signup has no account password (browser capture: email_verification_mode=passwordless_signup).
+	password := ""
 
-	logf(opt, "path=chatgpt_web · authorize · %s", email)
+	logf(opt, "path=chatgpt_web · passwordless · authorize · %s", email)
 	verifier, challenge, err := pkce.Generate()
 	if err != nil {
 		return nil, err
@@ -160,33 +160,19 @@ func runChatGPTWeb(opt Options) (*Result, error) {
 	if err := opt.errIfDone(); err != nil {
 		return nil, err
 	}
+	// Boundary slightly before authorize: login_hint often auto-sends OTP on authorize.
+	otpBoundary := time.Now().UTC().Add(-5 * time.Second)
 	if err := chatgptAuthorize(client, email, deviceID, challenge); err != nil {
 		return nil, err
 	}
+	// Land on verification page so auth-session cookies stick (do NOT re-send OTP yet —
+	// a second send can invalidate the authorize session → validate 409 invalid_state).
+	_, _ = client.Get(AuthBase+"/email-verification", navigateHeaders(AuthBase+"/"), true)
 
 	if err := opt.errIfDone(); err != nil {
 		return nil, err
 	}
-	// Password path (older protocol). Web capture skips this (passwordless_signup).
-	logf(opt, "register user (password path) · %s %s", first, last)
-	usedPassword := true
-	if err := registerUser(client, email, password, deviceID, opt.SentinelVMDir); err != nil {
-		logf(opt, "password register skip · %v · try passwordless", err)
-		usedPassword = false
-		password = "" // no password set
-	}
-
-	if err := opt.errIfDone(); err != nil {
-		return nil, err
-	}
-	logf(opt, "send OTP")
-	if err := sendOTP(client); err != nil {
-		// Passwordless + login_hint often auto-sends OTP on authorize; ignore soft fail.
-		logf(opt, "send OTP soft-fail · %v · continue (may already be sent)", err)
-	}
-	otpSentAt := time.Now().UTC()
-
-	otpCode, err := waitOTP(opt, otpSentAt)
+	otpCode, err := waitOTPPasswordless(opt, client, otpBoundary)
 	if err != nil {
 		return nil, err
 	}
@@ -196,7 +182,31 @@ func runChatGPTWeb(opt Options) (*Result, error) {
 	logf(opt, "OTP · got %s · validate", otpCode)
 	if err := validateOTP(client, otpCode, deviceID, opt.SentinelVMDir); err != nil {
 		mail.UnclaimOTPCode(otpCode)
-		return nil, err
+		// 409 invalid_state: session died while waiting — one full re-auth + single OTP send.
+		if isInvalidAuthState(err) {
+			logf(opt, "validate 409 invalid_state · re-authorize once")
+			otpBoundary = time.Now().UTC().Add(-3 * time.Second)
+			if e2 := chatgptAuthorize(client, email, deviceID, challenge); e2 != nil {
+				return nil, fmt.Errorf("%w (re-auth: %v)", err, e2)
+			}
+			_, _ = client.Get(AuthBase+"/email-verification", navigateHeaders(AuthBase+"/"), true)
+			if e2 := sendOTP(client); e2 != nil {
+				logf(opt, "re-auth send OTP soft-fail · %v", e2)
+			} else {
+				otpBoundary = time.Now().UTC()
+			}
+			otpCode, e2 := waitOTP(opt, otpBoundary)
+			if e2 != nil {
+				return nil, fmt.Errorf("%w (re-auth otp: %v)", err, e2)
+			}
+			logf(opt, "OTP · got %s · validate (retry)", otpCode)
+			if e2 := validateOTP(client, otpCode, deviceID, opt.SentinelVMDir); e2 != nil {
+				mail.UnclaimOTPCode(otpCode)
+				return nil, e2
+			}
+		} else {
+			return nil, err
+		}
 	}
 
 	if err := opt.errIfDone(); err != nil {
@@ -207,44 +217,62 @@ func runChatGPTWeb(opt Options) (*Result, error) {
 	logf(opt, "create account · %s · dob %s", fullName, birth)
 	continueURL, authCode, err := createAccount(client, fullName, birth, deviceID, opt.SentinelVMDir)
 	if err != nil {
-		return nil, err
+		// One soft retry: re-warm about-you + new sentinel (common flake under concurrency).
+		logf(opt, "create_account soft-retry · %v", err)
+		if err2 := opt.errIfDone(); err2 != nil {
+			return nil, err2
+		}
+		time.Sleep(800 * time.Millisecond)
+		continueURL, authCode, err = createAccount(client, fullName, birth, deviceID, opt.SentinelVMDir)
+		if err != nil {
+			return nil, err
+		}
 	}
 
 	if err := opt.errIfDone(); err != nil {
 		return nil, err
 	}
-	// Prefer NextAuth callback → /api/auth/session (matches real browser).
-	// This is critical: without session_token the pipeline cannot elevate the
-	// AT JWT to chatgpt_plan_type=k12 after join+approve (check API alone is not enough).
+	// NextAuth callback → session cookie + accessToken (required for later k12 elevate).
 	logf(opt, "redeem session via chatgpt callback")
 	tokens, err := redeemViaSession(client, continueURL)
 	if err != nil {
-		logf(opt, "session redeem fail · %v · try oauth/token", err)
+		logf(opt, "session redeem fail · %v · try oauth/token + bootstrap", err)
 		tokens, err = exchangeTokens(client, verifier, authCode, ClientID, RedirectURI, ChatGPTBase)
 		if err != nil {
 			return nil, err
 		}
-		// oauth/token path usually has no NextAuth cookie. Best-effort bootstrap:
-		// follow homepage → if auth cookies SSO, may still mint a session.
 		if tokens["session_token"] == "" {
 			if st, bootErr := bootstrapSessionToken(client); bootErr == nil && st != "" {
 				tokens["session_token"] = st
 				logf(opt, "session bootstrap ok · ST=yes")
+				// Prefer Web session AT if pullable (better for elevate than bare oauth AT).
+				if sess, e := pullSessionJSON(client); e == nil && sess["access_token"] != "" {
+					tokens["access_token"] = sess["access_token"]
+					if sess["session_token"] != "" {
+						tokens["session_token"] = sess["session_token"]
+					}
+					logf(opt, "session AT after bootstrap ok")
+				}
 			} else if bootErr != nil {
 				logf(opt, "session bootstrap skip · %v", bootErr)
 			}
 		}
 	} else if tokens["session_token"] == "" {
-		// JSON omitted sessionToken — cookie harvest already tried inside redeem.
-		logf(opt, "session redeem ok but ST empty · elevate may fail")
+		logf(opt, "session redeem ok but ST empty · try bootstrap")
+		if st, bootErr := bootstrapSessionToken(client); bootErr == nil && st != "" {
+			tokens["session_token"] = st
+			logf(opt, "session bootstrap ok · ST=yes")
+		} else {
+			logf(opt, "session ST empty · elevate may fail")
+		}
 	} else {
-		logf(opt, "session redeem ok · ST=yes")
+		logf(opt, "session redeem ok · ST=yes AT=%v", tokens["access_token"] != "")
 	}
 
-	src := "chatgpt_web"
-	if usedPassword {
-		src = "chatgpt_web_password"
+	if tokens["access_token"] == "" {
+		return nil, fmt.Errorf("chatgpt_web missing access_token after redeem")
 	}
+
 	return &Result{
 		Email:        email,
 		Password:     password,
@@ -252,7 +280,7 @@ func runChatGPTWeb(opt Options) (*Result, error) {
 		RefreshToken: tokens["refresh_token"],
 		IDToken:      tokens["id_token"],
 		SessionToken: tokens["session_token"],
-		SourceType:   src,
+		SourceType:   "chatgpt_web",
 		CreatedAt:    time.Now().UTC().Format(time.RFC3339),
 	}, nil
 }
@@ -382,6 +410,58 @@ func waitOTP(opt Options, otpSentAt time.Time) (string, error) {
 	})
 }
 
+// waitOTPPasswordless waits for auto-sent OTP first; only if nothing arrives in ~7s
+// do we call send once (avoids double-send invalidating authorize session).
+func waitOTPPasswordless(opt Options, client *httpx.Client, otpBoundary time.Time) (string, error) {
+	timeout := opt.OTPTimeout
+	if timeout <= 0 {
+		timeout = 30 * time.Second
+	}
+	interval := opt.OTPInterval
+	if interval <= 0 {
+		interval = 1500 * time.Millisecond
+	}
+	logf(opt, "OTP · waiting (auto-send first) · timeout=%s", timeout)
+	var lastTick time.Time
+	var lastNote string
+	sentExtra := false
+	return mail.WaitForCode(opt.ctx(), opt.Mailbox, timeout, interval, otpBoundary, func(elapsed, total time.Duration, note string) {
+		// Delayed single send if inbox quiet — do not send immediately after authorize.
+		if !sentExtra && elapsed >= 7*time.Second &&
+			(strings.Contains(note, "cand=0") || strings.Contains(note, "inbox msgs=0") || strings.Contains(note, "matched") == false) {
+			// Only fire when we have not matched yet (note rarely contains matched before success returns).
+			if !strings.Contains(note, "matched") {
+				sentExtra = true
+				logf(opt, "OTP · no mail yet · send once")
+				if err := sendOTP(client); err != nil {
+					logf(opt, "OTP · delayed send soft-fail · %v", err)
+				}
+			}
+		}
+		interesting := strings.Contains(note, "matched") || strings.Contains(note, "graph err") || strings.Contains(note, "send")
+		now := time.Now()
+		if !interesting && note == lastNote && now.Sub(lastTick) < 10*time.Second {
+			return
+		}
+		if !interesting && now.Sub(lastTick) < 8*time.Second {
+			return
+		}
+		lastTick = now
+		lastNote = note
+		logf(opt, "OTP · %0.0f/%0.0fs · %s", elapsed.Seconds(), total.Seconds(), note)
+	})
+}
+
+func isInvalidAuthState(err error) bool {
+	if err == nil {
+		return false
+	}
+	s := strings.ToLower(err.Error())
+	return strings.Contains(s, "invalid_state") ||
+		strings.Contains(s, "sign-in session is no longer valid") ||
+		strings.Contains(s, "session is no longer valid")
+}
+
 // platformAuthorize is the legacy Platform SPA OAuth authorize step.
 func platformAuthorize(client *httpx.Client, email, deviceID, challenge string) error {
 	q := url.Values{}
@@ -476,30 +556,38 @@ func bootstrapSessionToken(client *httpx.Client) (string, error) {
 	return "", fmt.Errorf("no session cookie after SSO bootstrap")
 }
 
-// chatgptAuthorize mirrors chatgpt.com NextAuth sign-in → authorize.
+// chatgptAuthorize mirrors chatgpt.com NextAuth sign-in → authorize (browser order).
 // Falls back to a direct authorize hit if signin bootstrap fails.
 func chatgptAuthorize(client *httpx.Client, email, deviceID, challenge string) error {
-	// Warm chatgpt origin (csrf/cookies).
-	_, _ = client.Get(ChatGPTBase+"/", navigateHeaders(""), true)
+	// Browser-ish warm-up: home → providers → csrf → signin/openai → authorize.
+	nav := navigateHeaders("")
+	_, _ = client.Get(ChatGPTBase+"/", nav, true)
+	apiH := map[string]string{
+		"accept":          "application/json",
+		"accept-language": "en-US,en;q=0.9",
+		"referer":         ChatGPTBase + "/",
+		"user-agent":      httpx.UserAgent,
+		"sec-ch-ua":       httpx.SecChUA,
+		"sec-ch-ua-mobile": "?0",
+		"sec-ch-ua-platform": `"Windows"`,
+	}
+	_, _ = client.Get(ChatGPTBase+"/api/auth/providers", apiH, false)
 
 	csrf := ""
-	if resp, err := client.Get(ChatGPTBase+"/api/auth/csrf", map[string]string{
-		"accept":     "application/json",
-		"referer":    ChatGPTBase + "/",
-		"user-agent": httpx.UserAgent,
-	}, false); err == nil && resp.StatusCode == 200 {
+	if resp, err := client.Get(ChatGPTBase+"/api/auth/csrf", apiH, false); err == nil && resp.StatusCode == 200 {
 		var body map[string]any
 		_ = json.Unmarshal(resp.Body, &body)
 		csrf, _ = body["csrfToken"].(string)
 	}
 
 	authURL := ""
+	authSessionLogID := randomUUID()
 	if csrf != "" {
 		q := url.Values{}
 		q.Set("prompt", "login")
 		q.Set("ext-passkey-client-capabilities", "01111")
 		q.Set("ext-oai-did", deviceID)
-		q.Set("auth_session_logging_id", randomUUID())
+		q.Set("auth_session_logging_id", authSessionLogID)
 		q.Set("screen_hint", "login_or_signup")
 		q.Set("login_hint", email)
 		form := url.Values{}
@@ -507,11 +595,18 @@ func chatgptAuthorize(client *httpx.Client, email, deviceID, challenge string) e
 		form.Set("csrfToken", csrf)
 		form.Set("json", "true")
 		headers := map[string]string{
-			"accept":       "*/*",
-			"content-type": "application/x-www-form-urlencoded",
-			"origin":       ChatGPTBase,
-			"referer":      ChatGPTBase + "/",
-			"user-agent":   httpx.UserAgent,
+			"accept":             "*/*",
+			"accept-language":    "en-US,en;q=0.9",
+			"content-type":       "application/x-www-form-urlencoded",
+			"origin":             ChatGPTBase,
+			"referer":            ChatGPTBase + "/",
+			"user-agent":         httpx.UserAgent,
+			"sec-ch-ua":          httpx.SecChUA,
+			"sec-ch-ua-mobile":   "?0",
+			"sec-ch-ua-platform": `"Windows"`,
+			"sec-fetch-dest":     "empty",
+			"sec-fetch-mode":     "cors",
+			"sec-fetch-site":     "same-origin",
 		}
 		resp, err := client.Post(ChatGPTBase+"/api/auth/signin/openai?"+q.Encode(), []byte(form.Encode()), headers, false)
 		if err == nil && resp.StatusCode == 200 {
@@ -522,17 +617,18 @@ func chatgptAuthorize(client *httpx.Client, email, deviceID, challenge string) e
 	}
 
 	if authURL == "" {
-		// Direct authorize (still Web client + full scopes). Include PKCE for oauth/token fallback.
+		// Direct authorize (Web client + full scopes). PKCE kept for oauth/token fallback.
 		authURL = buildAuthorizeURL(email, deviceID, challenge, true)
 	}
 
 	headers := navigateHeaders(ChatGPTBase + "/")
+	headers["sec-fetch-site"] = "cross-site"
 	resp, err := client.Get(authURL, headers, true)
 	if err != nil {
 		return err
 	}
-	// 200 landing on create-account / email-verification / password is OK.
-	if resp.StatusCode != 200 && resp.StatusCode != 302 {
+	// 200 landing on email-verification / create-account is OK.
+	if resp.StatusCode != 200 && resp.StatusCode != 302 && resp.StatusCode != 303 {
 		return fmt.Errorf("chatgpt_authorize HTTP %d: %s", resp.StatusCode, httpx.DumpSnippet(resp.Body, 300))
 	}
 	return nil
@@ -676,91 +772,115 @@ func redeemViaSession(client *httpx.Client, continueURL string) (map[string]stri
 	if continueURL == "" {
 		return nil, fmt.Errorf("empty continue_url")
 	}
+	// Follow redirects so Set-Cookie lands in jar (critical for session_token).
 	headers := navigateHeaders(AuthBase + "/")
 	headers["sec-fetch-site"] = "cross-site"
+	headers["accept-language"] = httpx.AcceptLanguage
 	resp, err := client.Get(continueURL, headers, true)
 	if err != nil {
 		return nil, fmt.Errorf("callback: %w", err)
 	}
-	// 200/302 both fine after redirects into chatgpt.com
 	if resp.StatusCode >= 400 {
 		return nil, fmt.Errorf("callback HTTP %d: %s", resp.StatusCode, httpx.DumpSnippet(resp.Body, 200))
 	}
 
-	// Warm chatgpt origin once more — helps NextAuth cookie settle.
+	// Let NextAuth cookie settle, then warm homepage (browser after redirect).
+	time.Sleep(350 * time.Millisecond)
 	_, _ = client.Get(ChatGPTBase+"/", navigateHeaders(ChatGPTBase+"/"), true)
+	time.Sleep(200 * time.Millisecond)
 
-	sessHeaders := map[string]string{
-		"accept":     "application/json",
-		"referer":    ChatGPTBase + "/",
-		"origin":     ChatGPTBase,
-		"user-agent": httpx.UserAgent,
+	out, err := pullSessionJSON(client)
+	if err != nil {
+		return nil, err
 	}
-	var data map[string]any
+	if out["access_token"] == "" {
+		return nil, fmt.Errorf("auth/session missing accessToken")
+	}
+	return out, nil
+}
+
+// pullSessionJSON GETs /api/auth/session with retries; harvests session_token from jar.
+func pullSessionJSON(client *httpx.Client) (map[string]string, error) {
+	sessHeaders := map[string]string{
+		"accept":             "application/json",
+		"accept-language":    httpx.AcceptLanguage,
+		"referer":            ChatGPTBase + "/",
+		"origin":             ChatGPTBase,
+		"user-agent":         httpx.UserAgent,
+		"sec-ch-ua":          httpx.SecChUA,
+		"sec-ch-ua-mobile":   "?0",
+		"sec-ch-ua-platform": `"Windows"`,
+		"sec-fetch-dest":     "empty",
+		"sec-fetch-mode":     "cors",
+		"sec-fetch-site":     "same-origin",
+	}
 	var lastBody []byte
 	var lastStatus int
-	for attempt := 1; attempt <= 4; attempt++ {
-		resp, err = client.Get(ChatGPTBase+"/api/auth/session", sessHeaders, false)
+	var lastErr error
+	for attempt := 1; attempt <= 6; attempt++ {
+		resp, err := client.Get(ChatGPTBase+"/api/auth/session", sessHeaders, false)
 		if err != nil {
-			if attempt == 4 {
-				return nil, fmt.Errorf("auth/session: %w", err)
-			}
-			time.Sleep(time.Duration(attempt) * 400 * time.Millisecond)
+			lastErr = err
+			time.Sleep(time.Duration(attempt) * 350 * time.Millisecond)
 			continue
 		}
 		lastStatus = resp.StatusCode
 		lastBody = resp.Body
 		if resp.StatusCode != 200 {
-			if attempt < 4 && (resp.StatusCode == 403 || resp.StatusCode == 429 || resp.StatusCode >= 500) {
-				time.Sleep(time.Duration(attempt) * 500 * time.Millisecond)
+			lastErr = fmt.Errorf("auth/session HTTP %d: %s", resp.StatusCode, httpx.DumpSnippet(resp.Body, 160))
+			if attempt < 6 && (resp.StatusCode == 403 || resp.StatusCode == 429 || resp.StatusCode >= 500) {
+				time.Sleep(time.Duration(attempt) * 450 * time.Millisecond)
 				continue
 			}
-			return nil, fmt.Errorf("auth/session HTTP %d: %s", resp.StatusCode, httpx.DumpSnippet(resp.Body, 200))
-		}
-		if err := json.Unmarshal(resp.Body, &data); err != nil {
-			if attempt == 4 {
-				return nil, fmt.Errorf("auth/session json: %w", err)
+			if attempt < 6 {
+				time.Sleep(time.Duration(attempt) * 300 * time.Millisecond)
+				continue
 			}
+			return nil, lastErr
+		}
+		var data map[string]any
+		if err := json.Unmarshal(resp.Body, &data); err != nil {
+			lastErr = err
 			time.Sleep(time.Duration(attempt) * 300 * time.Millisecond)
 			continue
 		}
-		break
-	}
-	if data == nil {
-		return nil, fmt.Errorf("auth/session HTTP %d: %s", lastStatus, httpx.DumpSnippet(lastBody, 200))
-	}
-	out := map[string]string{}
-	if v, ok := data["accessToken"].(string); ok {
-		out["access_token"] = strings.TrimSpace(v)
-	}
-	if v, ok := data["access_token"].(string); ok && out["access_token"] == "" {
-		out["access_token"] = strings.TrimSpace(v)
-	}
-	if v, ok := data["sessionToken"].(string); ok {
-		out["session_token"] = strings.TrimSpace(v)
-	}
-	if v, ok := data["session_token"].(string); ok && out["session_token"] == "" {
-		out["session_token"] = strings.TrimSpace(v)
-	}
-	// Cookie jar is the durable session source for later K12 elevate.
-	if st := client.Cookie(ChatGPTBase+"/", "__Secure-next-auth.session-token"); st != "" {
-		out["session_token"] = st
-	} else if st := client.Cookie(ChatGPTBase+"/", "next-auth.session-token"); st != "" {
-		out["session_token"] = st
-	}
-	// Optional account fields from session JSON.
-	if acc, ok := data["account"].(map[string]any); ok {
-		if id, _ := acc["id"].(string); strings.TrimSpace(id) != "" {
-			out["chatgpt_account_id"] = strings.TrimSpace(id)
+		out := map[string]string{}
+		if v, ok := data["accessToken"].(string); ok {
+			out["access_token"] = strings.TrimSpace(v)
 		}
-		if p, _ := acc["planType"].(string); strings.TrimSpace(p) != "" {
-			out["plan_type"] = strings.ToLower(strings.TrimSpace(p))
+		if v, ok := data["access_token"].(string); ok && out["access_token"] == "" {
+			out["access_token"] = strings.TrimSpace(v)
 		}
+		if v, ok := data["sessionToken"].(string); ok {
+			out["session_token"] = strings.TrimSpace(v)
+		}
+		if v, ok := data["session_token"].(string); ok && out["session_token"] == "" {
+			out["session_token"] = strings.TrimSpace(v)
+		}
+		if st := client.Cookie(ChatGPTBase+"/", "__Secure-next-auth.session-token"); st != "" {
+			out["session_token"] = st
+		} else if st := client.Cookie(ChatGPTBase+"/", "next-auth.session-token"); st != "" {
+			out["session_token"] = st
+		}
+		if acc, ok := data["account"].(map[string]any); ok {
+			if id, _ := acc["id"].(string); strings.TrimSpace(id) != "" {
+				out["chatgpt_account_id"] = strings.TrimSpace(id)
+			}
+			if p, _ := acc["planType"].(string); strings.TrimSpace(p) != "" {
+				out["plan_type"] = strings.ToLower(strings.TrimSpace(p))
+			}
+		}
+		if out["access_token"] == "" {
+			lastErr = fmt.Errorf("auth/session empty accessToken (status=%d)", lastStatus)
+			time.Sleep(time.Duration(attempt) * 400 * time.Millisecond)
+			continue
+		}
+		return out, nil
 	}
-	if out["access_token"] == "" {
-		return nil, fmt.Errorf("auth/session missing accessToken: %s", httpx.DumpSnippet(lastBody, 240))
+	if lastErr != nil {
+		return nil, lastErr
 	}
-	return out, nil
+	return nil, fmt.Errorf("auth/session failed: %s", httpx.DumpSnippet(lastBody, 200))
 }
 
 func exchangeTokens(client *httpx.Client, verifier, code, clientID, redirectURI, origin string) (map[string]string, error) {
@@ -831,7 +951,7 @@ func jsonHeaders(referer, deviceID string) map[string]string {
 	h := map[string]string{
 		"accept":                          "application/json",
 		"accept-encoding":                 "gzip, deflate, br",
-		"accept-language":                 "en-US,en;q=0.9",
+		"accept-language":                 httpx.AcceptLanguage,
 		"cache-control":                   "no-cache",
 		"Content-Type":                    "application/json",
 		"origin":                          "https://auth.openai.com",
@@ -871,8 +991,8 @@ func datadogHeaders() map[string]string {
 
 func navigateHeaders(referer string) map[string]string {
 	h := map[string]string{
-		"accept":                    "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
-		"accept-language":           "en-US,en;q=0.9",
+		"accept":                    "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8",
+		"accept-language":           httpx.AcceptLanguage,
 		"cache-control":             "max-age=0",
 		"sec-ch-ua":                 httpx.SecChUA,
 		"sec-ch-ua-mobile":          "?0",
