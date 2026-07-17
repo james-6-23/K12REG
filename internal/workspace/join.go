@@ -126,7 +126,8 @@ func LoadManagerSession(path string) (ManagerSession, error) {
 	}, nil
 }
 
-// RefreshAccessToken exchanges a platform refresh_token for a new access_token.
+// RefreshAccessToken exchanges a refresh_token for a new access_token.
+// Tries ChatGPT Web client first (app_X8z…), then legacy Platform client.
 func RefreshAccessToken(refreshToken, proxy string) (accessToken string, err error) {
 	refreshToken = strings.TrimSpace(refreshToken)
 	if refreshToken == "" {
@@ -137,26 +138,44 @@ func RefreshAccessToken(refreshToken, proxy string) (accessToken string, err err
 		return "", err
 	}
 	defer client.Close()
-	form := url.Values{}
-	form.Set("client_id", "app_2SKx67EdpoN0G6j64rFvigXD")
-	form.Set("grant_type", "refresh_token")
-	form.Set("refresh_token", refreshToken)
-	resp, err := client.PostForm("https://auth.openai.com/oauth/token", form, map[string]string{
-		"Accept": "application/json",
-	})
-	if err != nil {
-		return "", err
+
+	try := func(clientID string) (string, error) {
+		form := url.Values{}
+		form.Set("client_id", clientID)
+		form.Set("grant_type", "refresh_token")
+		form.Set("refresh_token", refreshToken)
+		resp, err := client.PostForm("https://auth.openai.com/oauth/token", form, map[string]string{
+			"Accept": "application/json",
+		})
+		if err != nil {
+			return "", err
+		}
+		if resp.StatusCode != 200 {
+			return "", fmt.Errorf("oauth refresh HTTP %d: %s", resp.StatusCode, httpx.DumpSnippet(resp.Body, 160))
+		}
+		var data map[string]any
+		_ = json.Unmarshal(resp.Body, &data)
+		at, _ := data["access_token"].(string)
+		if strings.TrimSpace(at) == "" {
+			return "", fmt.Errorf("oauth refresh missing access_token")
+		}
+		return at, nil
 	}
-	if resp.StatusCode != 200 {
-		return "", fmt.Errorf("oauth refresh HTTP %d: %s", resp.StatusCode, httpx.DumpSnippet(resp.Body, 160))
+
+	// Web client (new protocol) → Platform client (legacy accounts).
+	const webClient = "app_X8zY6vW2pQ9tR3dE7nK1jL5gH"
+	const platformClient = "app_2SKx67EdpoN0G6j64rFvigXD"
+	if at, e := try(webClient); e == nil {
+		return at, nil
+	} else {
+		err = e
 	}
-	var data map[string]any
-	_ = json.Unmarshal(resp.Body, &data)
-	at, _ := data["access_token"].(string)
-	if strings.TrimSpace(at) == "" {
-		return "", fmt.Errorf("oauth refresh missing access_token")
+	if at, e := try(platformClient); e == nil {
+		return at, nil
+	} else if err == nil {
+		err = e
 	}
-	return at, nil
+	return "", err
 }
 
 // ApproveByEmail lists pending requests and accepts the matching invite.

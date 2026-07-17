@@ -23,6 +23,8 @@ type Config struct {
 	// Registration
 	Total   int
 	Threads int
+	// OAuthPath: register.PathChatGPTWeb | register.PathPlatform (settings: registration.oauth_path).
+	OAuthPath string
 
 	// Mail
 	MailboxesFile string
@@ -102,6 +104,7 @@ func Default() Config {
 		RequireSameDomain:    true,
 		MailBinding:          "shared",
 		ImportRequireK12:     true,
+		OAuthPath:            "chatgpt_web",
 	}
 }
 
@@ -142,6 +145,14 @@ func (c *Config) ApplyMap(raw map[string]any) {
 		}
 		if v, ok := asInt(m["threads"]); ok && v > 0 {
 			c.Threads = v
+		}
+		// oauth_path | auth_path | path aliases
+		if v, ok := m["oauth_path"].(string); ok && strings.TrimSpace(v) != "" {
+			c.OAuthPath = strings.TrimSpace(v)
+		} else if v, ok := m["auth_path"].(string); ok && strings.TrimSpace(v) != "" {
+			c.OAuthPath = strings.TrimSpace(v)
+		} else if v, ok := m["path"].(string); ok && strings.TrimSpace(v) != "" {
+			c.OAuthPath = strings.TrimSpace(v)
 		}
 	}
 	if m, ok := raw["mail"].(map[string]any); ok {

@@ -85,7 +85,7 @@ func seedDataDir(dir string) {
 	sp := filepath.Join(dir, settingsFile)
 	if _, err := os.Stat(sp); err != nil {
 		_ = os.WriteFile(sp, []byte(`{
-  "registration": { "mode": "protocol", "total": 1, "threads": 1, "pipeline_gate": "full" },
+  "registration": { "mode": "protocol", "total": 1, "threads": 1, "pipeline_gate": "full", "oauth_path": "chatgpt_web" },
   "workspace": { "enabled": true, "ids": [], "selected_id": "", "manager_session_file": "hotsession.json", "approve_requests": true },
   "mail": {
     "mailboxes_file": "hotmail.txt",

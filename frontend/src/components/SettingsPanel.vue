@@ -197,6 +197,8 @@ async function loadSettings() {
     await loadDataFiles()
     const s = await apiJSON<Settings>('/api/settings')
     s.registration.mode = 'protocol'
+    // UI only exposes ChatGPT Web protocol path.
+    s.registration.oauth_path = 'chatgpt_web'
     s.import_api = normalizeImportApi(s.import_api)
     if (!s.mail) s.mail = { mailboxes_file: '', alias_count: 1, wait_timeout: 30, wait_interval: 1.5 }
     if (!s.mail.alias_count || s.mail.alias_count < 1) s.mail.alias_count = 1
@@ -232,6 +234,7 @@ async function saveSettings() {
     return
   }
   settings.value.registration.mode = 'protocol'
+  settings.value.registration.oauth_path = 'chatgpt_web'
   settings.value.import_api = normalizeImportApi(settings.value.import_api)
   let ac = Number(settings.value.mail.alias_count) || 1
   if (ac < 1) ac = 1
@@ -295,7 +298,7 @@ onMounted(loadSettings)
             <label class="label !mb-1">模式</label>
             <div class="field flex w-full items-center gap-1.5 !py-2 text-sm text-slate-300">
               <span class="h-1.5 w-1.5 rounded-full bg-blue-400" />
-              协议
+              协议 · ChatGPT Web
             </div>
           </div>
           <div>

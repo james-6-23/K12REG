@@ -102,6 +102,12 @@ export interface RegistrationSettings {
   threads: number
   mode: string
   pipeline_gate: string
+  /**
+   * Protocol OAuth path:
+   * - chatgpt_web — ChatGPT Web client (app_X8z…), session redeem, full scopes
+   * - platform — legacy Platform client (app_2SK…), oauth/token only
+   */
+  oauth_path: 'chatgpt_web' | 'platform' | string
 }
 
 /** One mother session / workspace slot. */
@@ -266,7 +272,13 @@ export function defaultSettings(): Settings {
       require_k12: true,
       endpoints: [emptyImportEndpoint(1)],
     },
-    registration: { total: 1, threads: 1, mode: 'protocol', pipeline_gate: 'reg' },
+    registration: {
+      total: 1,
+      threads: 1,
+      mode: 'protocol',
+      pipeline_gate: 'reg',
+      oauth_path: 'chatgpt_web',
+    },
     workspace: {
       enabled: true,
       ids: [],

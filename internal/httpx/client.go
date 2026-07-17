@@ -73,6 +73,63 @@ func (c *Client) SetCookie(name, value, domain string) {
 	})
 }
 
+// Cookie returns the first cookie value matching name for the given URL host
+// (e.g. rawURL = "https://chatgpt.com/"). Empty string if missing.
+func (c *Client) Cookie(rawURL, name string) string {
+	if c == nil || c.Session == nil || c.Session.CookieJar == nil || name == "" {
+		return ""
+	}
+	u, err := url.Parse(rawURL)
+	if err != nil || u.Host == "" {
+		return ""
+	}
+	for _, ck := range c.Session.CookieJar.Cookies(u) {
+		if ck != nil && ck.Name == name && ck.Value != "" {
+			return ck.Value
+		}
+	}
+	// Chunked NextAuth cookies: name.0 + name.1 + …
+	var parts []string
+	prefix := name + "."
+	for _, ck := range c.Session.CookieJar.Cookies(u) {
+		if ck == nil || !strings.HasPrefix(ck.Name, prefix) || ck.Value == "" {
+			continue
+		}
+		// keep order by numeric suffix if possible
+		suf := strings.TrimPrefix(ck.Name, prefix)
+		idx := 0
+		if _, err := fmt.Sscanf(suf, "%d", &idx); err != nil {
+			continue
+		}
+		for len(parts) <= idx {
+			parts = append(parts, "")
+		}
+		parts[idx] = ck.Value
+	}
+	if len(parts) == 0 {
+		return ""
+	}
+	return strings.Join(parts, "")
+}
+
+// CookiesMap returns name→value for all cookies visible on rawURL.
+func (c *Client) CookiesMap(rawURL string) map[string]string {
+	out := map[string]string{}
+	if c == nil || c.Session == nil || c.Session.CookieJar == nil {
+		return out
+	}
+	u, err := url.Parse(rawURL)
+	if err != nil || u.Host == "" {
+		return out
+	}
+	for _, ck := range c.Session.CookieJar.Cookies(u) {
+		if ck != nil && ck.Name != "" && ck.Value != "" {
+			out[ck.Name] = ck.Value
+		}
+	}
+	return out
+}
+
 type Response struct {
 	StatusCode int
 	Header     map[string][]string

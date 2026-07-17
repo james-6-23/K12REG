@@ -24,6 +24,8 @@ func getEffectiveSettings(dataDir string) map[string]any {
 			"threads":       1,
 			"mode":          "protocol",
 			"pipeline_gate": "reg",
+			// oauth_path: chatgpt_web (default) | platform (legacy app_2SK)
+			"oauth_path": "chatgpt_web",
 		},
 		"workspace": map[string]any{
 			"enabled":              true,
@@ -83,11 +85,17 @@ func extractCurated(ov map[string]any) map[string]any {
 		out["import_api"] = normalizeImportAPI(m)
 	}
 	if m, ok := ov["registration"].(map[string]any); ok {
+		oauthPath := orStr(asString(m["oauth_path"]), "")
+		if oauthPath == "" {
+			oauthPath = orStr(asString(m["auth_path"]), "chatgpt_web")
+		}
+		oauthPath = normalizeOAuthPathSetting(oauthPath)
 		out["registration"] = map[string]any{
 			"total":         asInt(m["total"], 1),
 			"threads":       asInt(m["threads"], 1),
 			"mode":          orStr(asString(m["mode"]), "protocol"),
 			"pipeline_gate": orStr(asString(m["pipeline_gate"]), "reg"),
+			"oauth_path":    oauthPath,
 		}
 	}
 	if m, ok := ov["workspace"].(map[string]any); ok {
@@ -247,11 +255,16 @@ func sanitizeForm(in map[string]any) map[string]any {
 		out["import_api"] = sanitizeImportAPI(m)
 	}
 	if m, ok := in["registration"].(map[string]any); ok {
+		oauthPath := orStr(asString(m["oauth_path"]), "")
+		if oauthPath == "" {
+			oauthPath = orStr(asString(m["auth_path"]), "chatgpt_web")
+		}
 		out["registration"] = map[string]any{
 			"total":         asInt(m["total"], 1),
 			"threads":       asInt(m["threads"], 1),
 			"mode":          orStr(asString(m["mode"]), "protocol"),
 			"pipeline_gate": orStr(asString(m["pipeline_gate"]), "reg"),
+			"oauth_path":    normalizeOAuthPathSetting(oauthPath),
 		}
 	}
 	if m, ok := in["workspace"].(map[string]any); ok {
@@ -405,6 +418,15 @@ func normalizeManagers(raw any) []any {
 		out = append(out, entry)
 	}
 	return out
+}
+
+func normalizeOAuthPathSetting(s string) string {
+	switch strings.ToLower(strings.TrimSpace(s)) {
+	case "platform", "platform_oauth", "app_2sk", "legacy", "old":
+		return "platform"
+	default:
+		return "chatgpt_web"
+	}
 }
 
 // normalizeImportAPI converts legacy single-url shape into endpoints[].

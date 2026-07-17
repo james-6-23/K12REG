@@ -59,6 +59,9 @@ func Run(opt Options) (stats Stats, err error) {
 	start := time.Now()
 	defer func() { stats.Elapsed = time.Since(start) }()
 
+	oauthPath := register.NormalizeOAuthPath(cfg.OAuthPath)
+	opt.log("oauth path · %s", oauthPath)
+
 	var mgr workspace.ManagerSession
 	var hasMgr bool
 	if cfg.WorkspaceEnabled && cfg.ApproveRequests {
@@ -161,8 +164,9 @@ func Run(opt Options) (stats Stats, err error) {
 			}
 			opt.Pool.Mark(mb, true)
 			atomic.AddInt64(&stats.Registered, 1)
-			opt.log("%s registered · AT=%v RT=%v · proxy=%s",
-				tag, reg.AccessToken != "", reg.RefreshToken != "", maskProxy(proxy))
+			opt.log("%s registered · AT=%v RT=%v ST=%v · src=%s · proxy=%s",
+				tag, reg.AccessToken != "", reg.RefreshToken != "", reg.SessionToken != "",
+				reg.SourceType, maskProxy(proxy))
 
 			acc := storage.Account{
 				"email":         reg.Email,
@@ -172,6 +176,18 @@ func Run(opt Options) (stats Stats, err error) {
 				"id_token":      reg.IDToken,
 				"source_type":   reg.SourceType,
 				"created_at":    reg.CreatedAt,
+			}
+			if reg.SessionToken != "" {
+				acc["session_token"] = reg.SessionToken
+			}
+			// Hint for consumers: which OAuth client produced the final AT.
+			switch {
+			case reg.SourceType == "platform" || strings.HasPrefix(reg.SourceType, "platform"):
+				acc["client_id"] = "app_2SKx67EdpoN0G6j64rFvigXD"
+				acc["oauth_path"] = "platform"
+			case strings.HasPrefix(reg.SourceType, "chatgpt_web"):
+				acc["client_id"] = "app_X8zY6vW2pQ9tR3dE7nK1jL5gH"
+				acc["oauth_path"] = "chatgpt_web"
 			}
 
 			// Join only the currently selected workspace (not every id in the pool).
@@ -202,8 +218,8 @@ func Run(opt Options) (stats Stats, err error) {
 						opt.log("%s approve ok", tag)
 						acc["approve_status"] = "ok"
 						atomic.AddInt64(&stats.ApproveOK, 1)
-						// Brief wait for membership propagation (interruptible).
-						if err := sleepCtx(ctx, 1500*time.Millisecond); err != nil {
+						// Membership propagation often needs 5–20s after PATCH.
+						if err := sleepCtx(ctx, 6*time.Second); err != nil {
 							return
 						}
 					}
@@ -211,39 +227,143 @@ func Run(opt Options) (stats Stats, err error) {
 					acc["approve_status"] = "skipped"
 				}
 
-				// Refresh AT then re-check plan (membership often needs fresh token).
+				// Elevate → real k12 JWT via session cookie (not check-API label alone).
+				// Protocol/Web AT after register is usually free-scoped; join+approve
+				// only adds membership. Re-mint AT with account_id=workspace.
 				at := reg.AccessToken
-				if reg.RefreshToken != "" && acc["approve_status"] == "ok" {
-					if newAT, e := workspace.RefreshAccessToken(reg.RefreshToken, proxy); e == nil && newAT != "" {
-						at = newAT
-						reg.AccessToken = newAT
-						acc["access_token"] = newAT
-						opt.log("%s token refresh ok", tag)
-					} else if e != nil {
-						opt.log("%s token refresh: %v", tag, e)
+				st := reg.SessionToken
+				if st == "" {
+					st = str(acc["session_token"])
+				}
+				preferred := cfg.ActiveWorkspaceIDs()
+				if len(preferred) == 0 && activeWID != "" {
+					preferred = []string{activeWID}
+				}
+				elevatedOK := false
+				if joinStatus(joins) == "ok" && st != "" && len(preferred) > 0 {
+					for pass := 1; pass <= 3; pass++ {
+						if ctx.Err() != nil {
+							return
+						}
+						opt.log("%s elevate → k12 · pass %d/3 · ST=yes · ws=%s",
+							tag, pass, trunc(preferred[0], 10))
+						fields, e := workspace.ElevateSession(st, preferred, proxy)
+						if e != nil {
+							opt.log("%s elevate fail · pass %d: %v", tag, pass, e)
+						} else if fields.AccessToken != "" {
+							at = fields.AccessToken
+							reg.AccessToken = fields.AccessToken
+							acc["access_token"] = fields.AccessToken
+							if fields.SessionToken != "" {
+								st = fields.SessionToken
+								reg.SessionToken = fields.SessionToken
+								acc["session_token"] = fields.SessionToken
+							}
+							if fields.ChatGPTAccountID != "" {
+								acc["chatgpt_account_id"] = fields.ChatGPTAccountID
+							}
+							if fields.PlanType != "" {
+								acc["plan_type"] = fields.PlanType
+							}
+							if fields.Expires != "" {
+								acc["expires"] = fields.Expires
+							}
+							// Success only when JWT carries workspace plan.
+							if workspace.JWTIsWorkspaceScoped(at) {
+								acc["workspace_scope"] = "elevated"
+								acc["elevate_status"] = "ok"
+								if jp := workspace.JWTPlanType(at); jp != "" {
+									acc["plan_type"] = jp
+								}
+								elevatedOK = true
+								opt.log("%s elevate ok · plan=%s jwt=%s id=%s",
+									tag,
+									str(acc["plan_type"]),
+									workspace.JWTPlanType(at),
+									trunc(str(acc["chatgpt_account_id"]), 12),
+								)
+								break
+							}
+							opt.log("%s elevate AT but jwt still free · plan=%s", tag, fields.PlanType)
+						}
+						// Re-approve + wait (membership lag under concurrency).
+						if hasMgr && cfg.ApproveRequests {
+							_ = workspace.ApproveByEmail(mgr, reg.Email, proxy, 3)
+						}
+						if err := sleepCtx(ctx, time.Duration(pass)*4*time.Second); err != nil {
+							return
+						}
+					}
+					if !elevatedOK {
+						acc["elevate_status"] = "failed"
+						opt.log("%s elevate not k12 yet (will check API · jwt may stay free)", tag)
+					}
+				} else if joinStatus(joins) == "ok" && st == "" {
+					acc["elevate_status"] = "no_session"
+					opt.log("%s no session_token · cannot cookie-elevate · JWT stays free until ST exists", tag)
+					// RT refresh alone does not add chatgpt_plan_type=k12.
+					if reg.RefreshToken != "" {
+						if newAT, e := workspace.RefreshAccessToken(reg.RefreshToken, proxy); e == nil && newAT != "" {
+							at = newAT
+							reg.AccessToken = newAT
+							acc["access_token"] = newAT
+							opt.log("%s token refresh ok (still need ST for k12 JWT)", tag)
+						} else if e != nil {
+							opt.log("%s token refresh: %v", tag, e)
+						}
 					}
 				}
 
-				if plan, aid, err := workspace.CheckPlan(at, proxy, cfg.ActiveWorkspaceIDs()); err == nil {
-					if plan != "" {
-						acc["plan_type"] = plan
-					}
+				// Check API: membership metadata only. Do NOT treat as k12 success
+				// unless JWT is workspace-scoped.
+				if plan, aid, err := workspace.CheckPlan(at, proxy, preferred); err == nil {
 					if aid != "" {
 						acc["chatgpt_account_id"] = aid
 					}
-					opt.log("%s plan=%s account=%s", tag, plan, trunc(aid, 12))
-					if isK12(plan) {
+					jwtScoped := workspace.JWTIsWorkspaceScoped(at)
+					jwtPlan := workspace.JWTPlanType(at)
+					if jwtScoped {
+						if jwtPlan != "" {
+							acc["plan_type"] = jwtPlan
+						} else if plan != "" {
+							acc["plan_type"] = plan
+						}
+						if acc["workspace_scope"] != "elevated" {
+							acc["workspace_scope"] = "check"
+						}
+					} else {
+						if plan != "" {
+							acc["check_plan_type"] = plan
+							// Keep free/empty plan_type when JWT is not scoped —
+							// avoids false k12 stats/import from check-only labels.
+							if str(acc["plan_type"]) == "" {
+								acc["plan_type"] = "free"
+							}
+						}
+						if workspace.IsWorkspacePlan(plan) {
+							acc["workspace_scope"] = "check_pending"
+						}
+					}
+					opt.log("%s plan=%s check=%s jwt=%s account=%s",
+						tag, str(acc["plan_type"]), plan, jwtOrFree(jwtPlan, jwtScoped), trunc(aid, 12))
+					if elevatedOK || jwtScoped {
 						atomic.AddInt64(&stats.K12, 1)
 					}
 				} else {
 					opt.log("%s plan check: %v", tag, err)
+					// Elevate already proved k12 via JWT.
+					if elevatedOK || workspace.JWTIsWorkspaceScoped(at) {
+						atomic.AddInt64(&stats.K12, 1)
+					}
 				}
 			}
 
 			// Optional import to one or more account pools.
+			// Gate on JWT workspace scope when require_k12 — check-API plan alone is insufficient.
 			importEps := cfg.ActiveImportEndpoints()
 			if len(importEps) > 0 && reg.AccessToken != "" {
 				plan := strings.ToLower(str(acc["plan_type"]))
+				jwtOK := workspace.JWTIsWorkspaceScoped(reg.AccessToken)
 				var results []map[string]any
 				okN, failN, skipN := 0, 0, 0
 				for _, ep := range importEps {
@@ -252,12 +372,14 @@ func Run(opt Options) (stats Stats, err error) {
 						label = ep.URL
 					}
 					reqK12 := ep.RequireK12
-					if reqK12 && !isK12(plan) {
+					// Must have real JWT workspace claims — check-API plan alone is not enough.
+					if reqK12 && !jwtOK {
 						skipN++
 						results = append(results, map[string]any{
-							"name": label, "url": ep.URL, "status": "skipped", "reason": "plan=" + plan,
+							"name": label, "url": ep.URL, "status": "skipped",
+							"reason": "jwt_not_k12 plan=" + plan,
 						})
-						opt.log("%s import skip · %s · plan=%s", tag, label, plan)
+						opt.log("%s import skip · %s · JWT not workspace-scoped plan=%s", tag, label, plan)
 						continue
 					}
 					// Import to own account-pool APIs should go direct (no reg proxy).
@@ -305,11 +427,15 @@ func Run(opt Options) (stats Stats, err error) {
 			if err := storage.AppendAccount(accountsPath, acc); err != nil {
 				opt.log("%s save accounts: %v", tag, err)
 			}
-			// Prefer writing token when plan is k12 (or always if no workspace).
+			// Prefer writing token when JWT is real k12 (or always if no workspace).
 			writeTok := reg.AccessToken
 			if cfg.WorkspaceEnabled && cfg.ImportRequireK12 {
-				if !isK12(str(acc["plan_type"])) {
+				if !workspace.JWTIsWorkspaceScoped(writeTok) && !isK12(str(acc["plan_type"])) {
 					writeTok = "" // still saved in JSON; skip free AT line
+				}
+				// Stricter: if we require k12 for import, only write JWT-scoped tokens.
+				if !workspace.JWTIsWorkspaceScoped(reg.AccessToken) {
+					writeTok = ""
 				}
 			}
 			if writeTok != "" {
@@ -362,6 +488,7 @@ func registerWithProxyRetry(
 			OTPTimeout:    time.Duration(cfg.WaitTimeout * float64(time.Second)),
 			OTPInterval:   time.Duration(cfg.WaitInterval * float64(time.Second)),
 			SentinelVMDir: cfg.SentinelVMDir,
+			OAuthPath:     cfg.OAuthPath,
 			Log:           func(s string) { opt.log("%s %s", tag, s) },
 			Ctx:           ctx,
 		})
@@ -450,7 +577,8 @@ func isRetryableRegister(err error) bool {
 		"invalid_auth_step",
 		"invalid authorization step",
 		// authorize / register step network flake (not OTP)
-		"platform_authorize", "user_register", "sentinel req", "sentinel_req",
+		"platform_authorize", "chatgpt_authorize", "user_register",
+		"sentinel req", "sentinel_req", "auth/session", "callback",
 	}
 	for _, k := range keys {
 		if strings.Contains(s, k) {
@@ -466,7 +594,20 @@ func isRetryableRegister(err error) bool {
 
 func isK12(plan string) bool {
 	p := strings.ToLower(strings.TrimSpace(plan))
-	return p == "k12" || p == "team" || p == "enterprise" || p == "edu"
+	return p == "k12" || p == "team" || p == "enterprise" || p == "edu" || p == "business"
+}
+
+func jwtOrFree(jwtPlan string, scoped bool) string {
+	if scoped && jwtPlan != "" {
+		return jwtPlan
+	}
+	if scoped {
+		return "ok"
+	}
+	if jwtPlan != "" {
+		return jwtPlan
+	}
+	return "free"
 }
 
 func str(v any) string {

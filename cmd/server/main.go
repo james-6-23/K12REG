@@ -149,7 +149,8 @@ func runCLI() {
 		proxies = []string{cfg.Proxy}
 	}
 
-	fmt.Printf("start · total=%d threads=%d workspace=%v\n", cfg.Total, cfg.Threads, cfg.WorkspaceEnabled)
+	fmt.Printf("start · total=%d threads=%d workspace=%v oauth=%s\n",
+		cfg.Total, cfg.Threads, cfg.WorkspaceEnabled, cfg.OAuthPath)
 	st, err := pipeline.Run(pipeline.Options{
 		Config:  cfg,
 		Proxies: proxies,

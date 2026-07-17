@@ -43,9 +43,6 @@ const dataFiles = ref<DataFile[]>([])
 const managerFile = ref('')
 const managerText = ref('')
 const targetText = ref('')
-/** session = 粘贴 JSON；register = 从邮箱池注册（无别名、从末尾取、标记 used） */
-const targetMode = ref<'session' | 'register'>('session')
-const mailboxesFile = ref('')
 const setOwner = ref(true)
 const running = ref(false)
 const loadingFile = ref(false)
@@ -56,7 +53,6 @@ const logs = ref<LogLine[]>([])
 const logBox = ref<HTMLElement | null>(null)
 const result = ref<JoinOwnerResult | null>(null)
 const saveHint = ref('可从数据目录选择母号 session 文件，或直接粘贴 JSON')
-const defaultMailboxesFile = ref('')
 const lastSavedFile = ref('')
 
 /** session 类 json（排除注册结果） */
@@ -69,14 +65,6 @@ const sessionFiles = computed(() =>
       f.name.toLowerCase() !== 'schedule.json',
   ),
 )
-
-/** 邮箱池 .txt（排除代理 / token 等） */
-const mailPoolFiles = computed(() => {
-  const skip = new Set(['access_token.txt', 'proxies.txt', 'proxy.txt'])
-  return dataFiles.value.filter(
-    (f) => f.name.toLowerCase().endsWith('.txt') && !skip.has(f.name.toLowerCase()),
-  )
-})
 
 function chipList(m: SessionMeta | null): [string, string][] {
   if (!m) return []
@@ -235,7 +223,6 @@ async function runJoin() {
   // 优先用数据目录文件：后端直接读 JSON 里的 account.id 作为空间 ID
   const body: Record<string, unknown> = {
     set_owner: setOwner.value,
-    target_mode: targetMode.value,
   }
   if (fileName) {
     body.manager_session_file = fileName
@@ -257,32 +244,23 @@ async function runJoin() {
     await parseOne(manager_session, 'manager')
   }
   if (!managerMeta.value?.account_id) {
-    toastError('母号 JSON 中未找到空间 ID（account.id），请确认是完整 session')
+    toastError('母号 JSON 中未找到空间 ID（account.id），请确认是完整 /api/auth/session')
     return
   }
 
-  if (targetMode.value === 'register') {
-    const mf = mailboxesFile.value.trim() || defaultMailboxesFile.value.trim()
-    if (!mf && !mailPoolFiles.value.length) {
-      toastError('请先上传邮箱池 .txt（如 hotmail.txt）')
-      return
-    }
-    if (mf) body.mailboxes_file = mf
-  } else {
-    const target_session = targetText.value.trim()
-    if (!target_session) {
-      toastError('请粘贴目标 session JSON')
-      return
-    }
-    let targetPayload: unknown = target_session
-    try {
-      if (target_session.startsWith('{')) targetPayload = JSON.parse(target_session)
-    } catch {
-      toastError('目标 session 不是合法 JSON')
-      return
-    }
-    body.target_session = targetPayload
+  const target_session = targetText.value.trim()
+  if (!target_session) {
+    toastError('请粘贴目标账号的 /api/auth/session JSON')
+    return
   }
+  let targetPayload: unknown = target_session
+  try {
+    if (target_session.startsWith('{')) targetPayload = JSON.parse(target_session)
+  } catch {
+    toastError('目标 session 不是合法 JSON')
+    return
+  }
+  body.target_session = targetPayload
 
   saveManager(false)
   running.value = true
@@ -294,14 +272,7 @@ async function runJoin() {
     'info',
     `母号空间 ID（来自 JSON）· ${ws}${fileName ? ` · 文件=${fileName}` : ''}`,
   )
-  if (targetMode.value === 'register') {
-    appendClientLog(
-      'info',
-      `开始执行 · 注册模式 · 池=${(body.mailboxes_file as string) || '默认'} · 无别名 · 从末尾取号`,
-    )
-  } else {
-    appendClientLog('info', '开始执行 · 粘贴目标 session …')
-  }
+  appendClientLog('info', '开始执行 · 目标 session（/api/auth/session）…')
 
   try {
     // SSE 流式日志（注册/OTP 可能很长，边跑边看）
@@ -396,7 +367,7 @@ async function runJoin() {
         has_access_token: true,
       }
     }
-    if (targetMode.value === 'register' && data.session_after) {
+    if (data.session_after) {
       try {
         targetText.value = JSON.stringify(data.session_after, null, 2)
       } catch {
@@ -520,23 +491,13 @@ async function bootstrap() {
   suppressFileWatch = true
   await loadDataFiles()
 
-  // 设置页里配置的母号 session / 邮箱池
+  // 设置页里配置的母号 session
   let settingsFile = ''
   try {
     const st = await apiJSON<Settings>('/api/settings')
     settingsFile = (st.workspace?.manager_session_file || '').trim()
-    defaultMailboxesFile.value = (st.mail?.mailboxes_file || '').trim()
   } catch {
     /* ignore */
-  }
-
-  // 默认邮箱池：设置 → hotmail.txt → 列表第一个
-  if (!mailboxesFile.value) {
-    mailboxesFile.value =
-      defaultMailboxesFile.value ||
-      (mailPoolFiles.value.find((f) => f.name === 'hotmail.txt')?.name ?? '') ||
-      mailPoolFiles.value[0]?.name ||
-      ''
   }
 
   // 浏览器记住的文件名 / 正文
@@ -573,10 +534,10 @@ onMounted(() => {
   <section class="animate-fade-in flex min-h-0 flex-1 flex-col gap-3 overflow-y-auto">
     <div class="card p-4 sm:p-5">
       <p class="text-sm ui-muted leading-relaxed">
-        选择母号 <strong class="ui-heading">session JSON</strong> 即可，
-        <strong class="ui-heading">空间 ID 自动从文件里的</strong>
-        <code class="text-xs">account.id</code>
-        <strong class="ui-heading">读取</strong>，无需再单独填写。目标账号可粘贴 session，或从邮箱池注册（无别名、末尾取号、标记 used）。流程：注册(可选) → join → 审批 →
+        选择母号 <strong class="ui-heading">session JSON</strong>（空间 ID 自动读
+        <code class="text-xs">account.id</code>）。目标账号请自行打开
+        <code class="text-xs">https://chatgpt.com/api/auth/session</code>
+        复制完整 JSON 粘贴（本页<strong class="ui-heading">不再从邮箱池注册</strong>）。流程：join → 审批 →
         <code class="text-xs">session_after</code>。
       </p>
     </div>
@@ -665,89 +626,34 @@ onMounted(() => {
 
     <!-- Target -->
     <div class="card p-4 sm:p-5">
-      <div class="mb-3 flex flex-wrap items-center justify-between gap-2">
-        <label class="text-xs font-semibold ui-muted tracking-wide">目标账号 *</label>
-        <div class="inline-flex rounded-lg border ui-border p-0.5 text-xs">
-          <button
-            type="button"
-            class="rounded-md px-3 py-1.5 transition"
-            :class="
-              targetMode === 'session'
-                ? 'bg-[var(--app-accent)] text-white'
-                : 'ui-muted hover:ui-heading'
-            "
-            :disabled="running"
-            @click="targetMode = 'session'"
-          >
-            粘贴 Session
-          </button>
-          <button
-            type="button"
-            class="rounded-md px-3 py-1.5 transition"
-            :class="
-              targetMode === 'register'
-                ? 'bg-[var(--app-accent)] text-white'
-                : 'ui-muted hover:ui-heading'
-            "
-            :disabled="running"
-            @click="targetMode = 'register'"
-          >
-            注册邮箱池
-          </button>
-        </div>
+      <label class="mb-2 block text-xs font-semibold ui-muted tracking-wide" for="tgt-json">
+        目标账号 Session *
+      </label>
+      <p class="mb-2 text-xs ui-muted leading-relaxed">
+        在目标账号浏览器打开
+        <code class="text-[11px]">https://chatgpt.com/api/auth/session</code>
+        ，复制完整 JSON 粘贴到下方（需含
+        <code class="text-[11px]">accessToken</code> /
+        <code class="text-[11px]">sessionToken</code>
+        等）。
+      </p>
+      <textarea
+        id="tgt-json"
+        v-model="targetText"
+        class="input font-mono text-xs min-h-[160px] w-full resize-y"
+        placeholder="粘贴 /api/auth/session JSON…"
+        @blur="parseOne(targetText, 'target')"
+      />
+      <div v-if="chipList(targetMeta).length" class="mt-2 flex flex-wrap gap-1.5">
+        <span
+          v-for="[k, v] in chipList(targetMeta)"
+          :key="k"
+          class="rounded-full px-2.5 py-0.5 text-[11px] ring-1 ui-border ui-surface"
+        >
+          <span class="ui-faint">{{ k }}:</span>
+          <strong class="ml-1 font-medium ui-heading">{{ v }}</strong>
+        </span>
       </div>
-
-      <template v-if="targetMode === 'register'">
-        <p class="mb-3 text-xs ui-muted leading-relaxed">
-          将从所选邮箱池<strong class="ui-heading">文件末尾</strong>取一个空闲账号，
-          <strong class="ui-heading">不生成别名</strong>（只用原邮箱），注册成功/失败后均
-          <strong class="ui-heading">标记为 used</strong>，再自动 join + 设 owner。
-        </p>
-        <div class="mb-2 grid grid-cols-1 gap-2 sm:grid-cols-[1fr_auto] sm:items-end">
-          <div>
-            <label class="label !mb-1">邮箱池文件</label>
-            <FileSelect
-              v-model="mailboxesFile"
-              :files="mailPoolFiles"
-              empty-text="暂无邮箱池 .txt，请先到「数据文件」上传"
-              placeholder="选择邮箱池（从末尾取号）"
-            />
-          </div>
-          <button
-            type="button"
-            class="btn btn-ghost btn-sm h-[38px]"
-            :disabled="loadingFile || running"
-            @click="loadDataFiles"
-          >
-            刷新列表
-          </button>
-        </div>
-        <p class="text-[11px] ui-faint">
-          当前：{{ mailboxesFile || defaultMailboxesFile || '（使用服务端默认）' }} · 强制
-          alias_count=1
-        </p>
-      </template>
-
-      <template v-else>
-        <label class="label !mb-1" for="tgt-json">Session JSON</label>
-        <textarea
-          id="tgt-json"
-          v-model="targetText"
-          class="input font-mono text-xs min-h-[160px] w-full resize-y"
-          placeholder="粘贴目标账号 session JSON（需 accessToken，建议含 email）…"
-          @blur="parseOne(targetText, 'target')"
-        />
-        <div v-if="chipList(targetMeta).length" class="mt-2 flex flex-wrap gap-1.5">
-          <span
-            v-for="[k, v] in chipList(targetMeta)"
-            :key="k"
-            class="rounded-full px-2.5 py-0.5 text-[11px] ring-1 ui-border ui-surface"
-          >
-            <span class="ui-faint">{{ k }}:</span>
-            <strong class="ml-1 font-medium ui-heading">{{ v }}</strong>
-          </span>
-        </div>
-      </template>
     </div>
 
     <!-- Actions -->
@@ -758,32 +664,14 @@ onMounted(() => {
           审批时设为 owner
         </label>
         <div class="flex-1" />
-        <button
-          type="button"
-          class="btn btn-ghost btn-sm"
-          :disabled="running || targetMode === 'register'"
-          @click="parseBoth"
-        >
+        <button type="button" class="btn btn-ghost btn-sm" :disabled="running" @click="parseBoth">
           解析两边
         </button>
-        <button
-          type="button"
-          class="btn btn-ghost btn-sm"
-          :disabled="running || targetMode === 'register'"
-          @click="clearTarget"
-        >
+        <button type="button" class="btn btn-ghost btn-sm" :disabled="running" @click="clearTarget">
           清空目标
         </button>
         <button type="button" class="btn btn-primary" :disabled="running" @click="runJoin">
-          {{
-            running
-              ? targetMode === 'register'
-                ? '注册并加入中…'
-                : '执行中…'
-              : targetMode === 'register'
-                ? '注册 → 加入并设 Owner'
-                : '加入空间并设 Owner'
-          }}
+          {{ running ? '执行中…' : '加入空间并设 Owner' }}
         </button>
       </div>
     </div>
