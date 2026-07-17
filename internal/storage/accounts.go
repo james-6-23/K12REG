@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strings"
 	"sync"
 )
 
@@ -265,6 +266,63 @@ func CountAccounts(dataDir string) int {
 	rows, total, _ := LoadAccountPage(dataDir, 0, 1, true)
 	_ = rows
 	return total
+}
+
+// LoadRegisteredEmails streams registered_accounts.jsonl and returns unique emails
+// (lowercase). Used to seed the mail pool so already-registered addresses are not reused.
+func LoadRegisteredEmails(dataDir string) []string {
+	mu.Lock()
+	defer mu.Unlock()
+	_ = ensureMigrated(dataDir)
+
+	seen := map[string]struct{}{}
+	var out []string
+	add := func(raw any) {
+		s, _ := raw.(string)
+		s = strings.ToLower(strings.TrimSpace(s))
+		if s == "" || !strings.Contains(s, "@") {
+			return
+		}
+		if _, ok := seen[s]; ok {
+			return
+		}
+		seen[s] = struct{}{}
+		out = append(out, s)
+	}
+
+	path := filepath.Join(dataDir, AccountsJSONL)
+	f, err := os.Open(path)
+	if err != nil {
+		// legacy array
+		b, e := os.ReadFile(filepath.Join(dataDir, AccountsJSON))
+		if e != nil {
+			return nil
+		}
+		var list []map[string]any
+		if json.Unmarshal(b, &list) != nil {
+			return nil
+		}
+		for _, a := range list {
+			add(a["email"])
+		}
+		return out
+	}
+	defer f.Close()
+	sc := bufio.NewScanner(f)
+	buf := make([]byte, 0, 256*1024)
+	sc.Buffer(buf, 8*1024*1024)
+	for sc.Scan() {
+		line := sc.Bytes()
+		if len(line) == 0 {
+			continue
+		}
+		var raw map[string]any
+		if json.Unmarshal(line, &raw) != nil {
+			continue
+		}
+		add(raw["email"])
+	}
+	return out
 }
 
 // ExportAccountsJSON writes a compact JSON array for download (streaming).

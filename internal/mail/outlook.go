@@ -403,23 +403,43 @@ func (p *Pool) Mark(mb Mailbox, success bool) {
 	_ = base // base no longer auto-burned on success
 }
 
-// SeedUsed marks emails as used without acquiring (e.g. already have session
-// files or rows in registered_accounts). Returns how many newly marked.
+// SeedUsed marks emails as used without acquiring (e.g. rows in registered_accounts).
+// Matches exact addresses and any pool slot with the same base or same expanded alias.
+// Returns how many state keys newly set to used.
 func (p *Pool) SeedUsed(emails []string) int {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	n := 0
+	mark := func(key string) {
+		key = strings.ToLower(strings.TrimSpace(key))
+		if key == "" || !strings.Contains(key, "@") {
+			return
+		}
+		cur := p.state[key]
+		if cur == "used" || cur == "token_invalid" {
+			return
+		}
+		p.state[key] = "used"
+		n++
+	}
 	for _, e := range emails {
 		key := strings.ToLower(strings.TrimSpace(e))
 		if key == "" || !strings.Contains(key, "@") {
 			continue
 		}
-		cur := p.state[key]
-		if cur == "used" || cur == "token_invalid" {
-			continue
+		mark(key)
+		// Also mark any pool item that is this address or shares base when email is the base.
+		for _, item := range p.items {
+			addr := strings.ToLower(item.Address)
+			base := mailboxBase(item)
+			if addr == key || base == key {
+				mark(addr)
+			}
+			// Registered alias equals expanded alias address.
+			if addr == key {
+				mark(addr)
+			}
 		}
-		p.state[key] = "used"
-		n++
 	}
 	if n > 0 {
 		p.saveState()

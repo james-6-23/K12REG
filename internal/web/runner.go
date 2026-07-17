@@ -12,6 +12,7 @@ import (
 	"k12reg/internal/config"
 	"k12reg/internal/mail"
 	"k12reg/internal/pipeline"
+	"k12reg/internal/storage"
 	"k12reg/internal/workspace"
 )
 
@@ -323,6 +324,11 @@ func (r *RunManager) run(ctx context.Context, count *int, workspaceID, source st
 		pool, e := mail.LoadPool(mailFile, statePath, slotCfg.AliasCount)
 		if e != nil {
 			return pipeline.Stats{}, e
+		}
+		// Skip emails already in registered_accounts.jsonl (and prior user_already_exists burns).
+		if seeded := pool.SeedUsed(storage.LoadRegisteredEmails(r.dataDir)); seeded > 0 {
+			r.emit(fmt.Sprintf("%s seed used from history · +%d · available=%d",
+				tag, seeded, pool.Available()))
 		}
 		r.emit(fmt.Sprintf("%s mail=%s · available=%d · ws=%s · @%s · quota=%d",
 			tag, mailName, pool.Available(), truncID(slot.WorkspaceID, 12),

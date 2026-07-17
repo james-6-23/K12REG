@@ -12,6 +12,7 @@ import (
 	"k12reg/internal/config"
 	"k12reg/internal/mail"
 	"k12reg/internal/pipeline"
+	"k12reg/internal/storage"
 	"k12reg/internal/web"
 )
 
@@ -133,6 +134,9 @@ func runCLI() {
 	pool, err := mail.LoadPool(mailFile, cfg.ResolvePath("outlook_token_state.json"), cfg.AliasCount)
 	if err != nil {
 		log.Fatalf("mail pool: %v", err)
+	}
+	if n := pool.SeedUsed(storage.LoadRegisteredEmails(cfg.DataDir)); n > 0 {
+		fmt.Printf("mail pool: seeded %d used from registered_accounts (available=%d)\n", n, pool.Available())
 	}
 	fmt.Printf("mail pool: %s\n", mailFile)
 

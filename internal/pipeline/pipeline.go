@@ -150,13 +150,19 @@ func Run(opt Options) (stats Stats, err error) {
 					opt.log("%s cancelled", tag)
 					return
 				}
-				// Graph token permanently dead → burn stock (cannot OTP again).
-				// Other register fails → free mailbox (do NOT mark used).
-				if mail.IsGraphAuthPermanent(regErr) {
+				// Permanent burns (cannot usefully retry this address):
+				//  - Graph token dead
+				//  - OpenAI user_already_exists (email already has an account)
+				// Soft fails → free mailbox for retry.
+				switch {
+				case mail.IsGraphAuthPermanent(regErr):
 					opt.Pool.MarkGraphDead(mb)
 					opt.log("%s REGISTER FAIL (graph dead · marked used): %v", tag, regErr)
-				} else {
-					opt.Pool.Mark(mb, false) // release in_use / failed → free again
+				case register.IsEmailAlreadyRegistered(regErr):
+					opt.Pool.Mark(mb, true) // burn this alias only
+					opt.log("%s REGISTER FAIL (email already registered · marked used): %v", tag, regErr)
+				default:
+					opt.Pool.Mark(mb, false) // release in_use → free again
 					opt.log("%s REGISTER FAIL (mailbox freed, not used): %v", tag, regErr)
 				}
 				atomic.AddInt64(&stats.Fail, 1)

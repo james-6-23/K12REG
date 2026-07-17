@@ -217,13 +217,16 @@ func runChatGPTWeb(opt Options) (*Result, error) {
 	logf(opt, "create account · %s · dob %s", fullName, birth)
 	continueURL, authCode, err := createAccount(client, fullName, birth, deviceID, opt.SentinelVMDir)
 	if err != nil {
-		// One soft retry: re-warm about-you + new sentinel (common flake under concurrency).
-		logf(opt, "create_account soft-retry · %v", err)
-		if err2 := opt.errIfDone(); err2 != nil {
-			return nil, err2
+		// user_already_exists is permanent for this address — do not soft-retry.
+		if !IsEmailAlreadyRegistered(err) {
+			// Soft retry only for sentinel/network flake.
+			logf(opt, "create_account soft-retry · %v", err)
+			if err2 := opt.errIfDone(); err2 != nil {
+				return nil, err2
+			}
+			time.Sleep(800 * time.Millisecond)
+			continueURL, authCode, err = createAccount(client, fullName, birth, deviceID, opt.SentinelVMDir)
 		}
-		time.Sleep(800 * time.Millisecond)
-		continueURL, authCode, err = createAccount(client, fullName, birth, deviceID, opt.SentinelVMDir)
 		if err != nil {
 			return nil, err
 		}
@@ -460,6 +463,19 @@ func isInvalidAuthState(err error) bool {
 	return strings.Contains(s, "invalid_state") ||
 		strings.Contains(s, "sign-in session is no longer valid") ||
 		strings.Contains(s, "session is no longer valid")
+}
+
+// IsEmailAlreadyRegistered reports OpenAI "account already exists for this email".
+// The address is burned for signup; pool should mark used (not free for retry).
+func IsEmailAlreadyRegistered(err error) bool {
+	if err == nil {
+		return false
+	}
+	s := strings.ToLower(err.Error())
+	return strings.Contains(s, "user_already_exists") ||
+		strings.Contains(s, "account already exists") ||
+		strings.Contains(s, "email_already") ||
+		strings.Contains(s, "already exists for this email")
 }
 
 // platformAuthorize is the legacy Platform SPA OAuth authorize step.
