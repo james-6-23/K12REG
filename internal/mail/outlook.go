@@ -40,6 +40,10 @@ type Mailbox struct {
 	RefreshToken string
 }
 
+// stateSaveDebounce batches disk writes so 10–20 concurrent Acquire/Mark
+// do not each MarshalIndent + WriteFile under the pool mutex.
+const stateSaveDebounce = 200 * time.Millisecond
+
 // Pool is a simple sequential mailbox allocator with disk state.
 type Pool struct {
 	mu            sync.Mutex
@@ -48,6 +52,17 @@ type Pool struct {
 	state         map[string]string // email_lower -> state
 	index         int
 	requireDomain string // if set, only acquire emails on this domain
+
+	// Indexes built once in LoadPool (immutable after load).
+	byAddr map[string]int   // lower address → item index
+	byBase map[string][]int // lower base email → item indices (aliases)
+
+	// inUseByBase: count of aliases currently in_use per base (O(1) baseBusy).
+	inUseByBase map[string]int
+
+	// Debounced state persistence (dirty + single flusher goroutine).
+	dirty         bool
+	saveScheduled bool
 }
 
 // SetRequireDomain restricts Acquire to addresses on domain (e.g. "hotmail.com").
@@ -109,16 +124,58 @@ func (p *Pool) baseBusyLocked(base string) bool {
 	if base == "" {
 		return false
 	}
-	for _, item := range p.items {
-		if mailboxBase(item) != base {
-			continue
-		}
-		if p.state[strings.ToLower(item.Address)] == "in_use" {
-			return true
-		}
+	if p.inUseByBase[base] > 0 {
+		return true
 	}
 	// Base itself may be marked in_use in edge cases.
 	return p.state[base] == "in_use"
+}
+
+// noteInUseDeltaLocked adjusts the per-base in_use counter when a key's state changes.
+func (p *Pool) noteInUseDeltaLocked(key, base, oldSt, newSt string) {
+	if base == "" {
+		base = key
+	}
+	was := oldSt == "in_use"
+	now := newSt == "in_use"
+	if was == now {
+		return
+	}
+	if now {
+		p.inUseByBase[base]++
+		return
+	}
+	if n := p.inUseByBase[base] - 1; n <= 0 {
+		delete(p.inUseByBase, base)
+	} else {
+		p.inUseByBase[base] = n
+	}
+}
+
+// setStateLocked writes state[key] and keeps inUseByBase in sync.
+// empty newSt deletes the key.
+func (p *Pool) setStateLocked(key, base, newSt string) {
+	key = strings.ToLower(strings.TrimSpace(key))
+	if key == "" {
+		return
+	}
+	if base == "" {
+		base = key
+	}
+	old := p.state[key]
+	if newSt == "" {
+		if old == "" {
+			return
+		}
+		delete(p.state, key)
+		p.noteInUseDeltaLocked(key, base, old, "")
+		return
+	}
+	if old == newSt {
+		return
+	}
+	p.state[key] = newSt
+	p.noteInUseDeltaLocked(key, base, old, newSt)
 }
 
 func emailDomain(email string) string {
@@ -262,12 +319,52 @@ func LoadPool(mailboxesFile, statePath string, aliasCount int) (*Pool, error) {
 		return nil, fmt.Errorf("no outlook credentials in %s", mailboxesFile)
 	}
 	p := &Pool{
-		items:     expandAliases(creds, aliasCount),
-		statePath: statePath,
-		state:     map[string]string{},
+		items:       expandAliases(creds, aliasCount),
+		statePath:   statePath,
+		state:       map[string]string{},
+		inUseByBase: map[string]int{},
 	}
+	p.buildIndex()
 	p.loadState()
+	p.rebuildInUseCounts()
 	return p, nil
+}
+
+// buildIndex constructs address/base maps once (pool items are immutable after load).
+func (p *Pool) buildIndex() {
+	n := len(p.items)
+	p.byAddr = make(map[string]int, n)
+	p.byBase = make(map[string][]int, n)
+	for i, mb := range p.items {
+		addr := strings.ToLower(mb.Address)
+		base := mailboxBase(mb)
+		p.byAddr[addr] = i
+		p.byBase[base] = append(p.byBase[base], i)
+	}
+}
+
+// rebuildInUseCounts syncs inUseByBase from state (after loadState).
+func (p *Pool) rebuildInUseCounts() {
+	p.inUseByBase = map[string]int{}
+	for _, mb := range p.items {
+		key := strings.ToLower(mb.Address)
+		if p.state[key] == "in_use" {
+			p.inUseByBase[mailboxBase(mb)]++
+		}
+	}
+	// Rare: base key itself marked in_use without an alias entry.
+	for k, st := range p.state {
+		if st != "in_use" {
+			continue
+		}
+		if _, ok := p.byAddr[k]; ok {
+			continue
+		}
+		// Treat bare base key as busy.
+		if p.inUseByBase[k] == 0 {
+			p.inUseByBase[k] = 1
+		}
+	}
 }
 
 func (p *Pool) loadState() {
@@ -294,17 +391,101 @@ func (p *Pool) loadState() {
 	}
 }
 
-func (p *Pool) saveState() {
+// scheduleSaveLocked marks state dirty and starts at most one flusher goroutine.
+// Caller must hold p.mu. Disk I/O happens outside the critical section.
+func (p *Pool) scheduleSaveLocked() {
 	if p.statePath == "" {
 		return
 	}
-	_ = os.MkdirAll(filepath.Dir(p.statePath), 0o755)
-	out := map[string]map[string]string{}
-	for k, st := range p.state {
-		out[k] = map[string]string{"state": st, "updated_at": time.Now().UTC().Format(time.RFC3339)}
+	p.dirty = true
+	if p.saveScheduled {
+		return
 	}
-	b, _ := json.MarshalIndent(out, "", "  ")
-	_ = os.WriteFile(p.statePath, append(b, '\n'), 0o644)
+	p.saveScheduled = true
+	go p.debouncedSave()
+}
+
+// saveState is the hot-path entry used by Acquire/Mark/Release (debounced).
+func (p *Pool) saveState() {
+	p.scheduleSaveLocked()
+}
+
+// saveStateNowLocked writes immediately (caller holds mu). Used by SeedUsed /
+// MarkGraphDead so one-shot bulk updates are durable before workers race.
+func (p *Pool) saveStateNowLocked() {
+	if p.statePath == "" {
+		return
+	}
+	path := p.statePath
+	snap := cloneState(p.state)
+	p.dirty = false
+	// Keep saveScheduled as-is; flusher will no-op if !dirty.
+	p.mu.Unlock()
+	writeStateFile(path, snap)
+	p.mu.Lock()
+}
+
+// FlushState forces a synchronous disk write of any pending dirty state.
+// Safe to call without holding mu (e.g. tests / shutdown).
+func (p *Pool) FlushState() {
+	p.mu.Lock()
+	if p.statePath == "" || !p.dirty {
+		p.mu.Unlock()
+		return
+	}
+	path := p.statePath
+	snap := cloneState(p.state)
+	p.dirty = false
+	p.mu.Unlock()
+	writeStateFile(path, snap)
+}
+
+func (p *Pool) debouncedSave() {
+	time.Sleep(stateSaveDebounce)
+	for {
+		p.mu.Lock()
+		if p.statePath == "" || !p.dirty {
+			p.saveScheduled = false
+			p.mu.Unlock()
+			return
+		}
+		path := p.statePath
+		snap := cloneState(p.state)
+		p.dirty = false
+		p.mu.Unlock()
+		writeStateFile(path, snap)
+		// If more mutations landed during the write, loop without extra sleep.
+	}
+}
+
+func cloneState(src map[string]string) map[string]string {
+	out := make(map[string]string, len(src))
+	for k, v := range src {
+		out[k] = v
+	}
+	return out
+}
+
+func writeStateFile(path string, state map[string]string) {
+	if path == "" {
+		return
+	}
+	_ = os.MkdirAll(filepath.Dir(path), 0o755)
+	now := time.Now().UTC().Format(time.RFC3339)
+	out := make(map[string]map[string]string, len(state))
+	for k, st := range state {
+		out[k] = map[string]string{"state": st, "updated_at": now}
+	}
+	// Compact JSON (no indent) — state can grow to thousands of keys under alias pools.
+	b, err := json.Marshal(out)
+	if err != nil {
+		return
+	}
+	tmp := path + ".tmp"
+	if err := os.WriteFile(tmp, append(b, '\n'), 0o644); err != nil {
+		return
+	}
+	_ = os.Rename(tmp, path)
 }
 
 // Acquire next available mailbox.
@@ -342,13 +523,14 @@ func (p *Pool) acquirePassLocked(preferIdleBase bool) (Mailbox, bool) {
 		if !p.entryUsableLocked(mb) {
 			continue
 		}
-		if preferIdleBase && p.baseBusyLocked(mailboxBase(mb)) {
+		base := mailboxBase(mb)
+		if preferIdleBase && p.baseBusyLocked(base) {
 			continue
 		}
 		key := strings.ToLower(mb.Address)
-		p.state[key] = "in_use"
+		p.setStateLocked(key, base, "in_use")
 		p.index = idx + 1
-		p.saveState()
+		p.scheduleSaveLocked()
 		return mb, true
 	}
 	return Mailbox{}, false
@@ -366,10 +548,11 @@ func (p *Pool) AcquireFromEnd() (Mailbox, error) {
 			continue
 		}
 		key := strings.ToLower(mb.Address)
-		p.state[key] = "in_use"
+		base := mailboxBase(mb)
+		p.setStateLocked(key, base, "in_use")
 		// Keep sequential index consistent if mixed with Acquire later.
 		p.index = i
-		p.saveState()
+		p.scheduleSaveLocked()
 		return mb, nil
 	}
 	return Mailbox{}, p.exhaustedErr()
@@ -390,22 +573,24 @@ func (p *Pool) Mark(mb Mailbox, success bool) {
 	base := mailboxBase(mb)
 	if !success {
 		// Soft-fail: free this alias only (sibling aliases unaffected).
-		if p.state[key] == "in_use" || p.state[key] == "failed" {
-			delete(p.state, key)
+		if st := p.state[key]; st == "in_use" || st == "failed" {
+			p.setStateLocked(key, base, "")
 		}
-		p.saveState()
+		p.scheduleSaveLocked()
 		return
 	}
 	// Success: burn this alias only — other plus-aliases of the same base stay usable.
 	// (Graph-dead still burns whole base via MarkGraphDead.)
-	p.state[key] = "used"
-	p.saveState()
-	_ = base // base no longer auto-burned on success
+	p.setStateLocked(key, base, "used")
+	p.scheduleSaveLocked()
 }
 
 // SeedUsed marks emails as used without acquiring (e.g. rows in registered_accounts).
 // Matches exact addresses and any pool slot with the same base or same expanded alias.
 // Returns how many state keys newly set to used.
+//
+// Complexity: O(len(emails) + marked aliases) via byAddr/byBase indexes —
+// not O(emails × pool) which was the main startup stall on large pools.
 func (p *Pool) SeedUsed(emails []string) int {
 	p.mu.Lock()
 	defer p.mu.Unlock()
@@ -419,7 +604,13 @@ func (p *Pool) SeedUsed(emails []string) int {
 		if cur == "used" || cur == "token_invalid" {
 			return
 		}
-		p.state[key] = "used"
+		// Seed marks are never in_use; use setState so counters stay consistent
+		// if we overwrite a stale in_use from a crashed prior run.
+		base := key
+		if i, ok := p.byAddr[key]; ok {
+			base = mailboxBase(p.items[i])
+		}
+		p.setStateLocked(key, base, "used")
 		n++
 	}
 	for _, e := range emails {
@@ -428,21 +619,23 @@ func (p *Pool) SeedUsed(emails []string) int {
 			continue
 		}
 		mark(key)
-		// Also mark any pool item that is this address or shares base when email is the base.
-		for _, item := range p.items {
-			addr := strings.ToLower(item.Address)
-			base := mailboxBase(item)
-			if addr == key || base == key {
-				mark(addr)
+		// Registered base → burn every expanded alias of that base.
+		if idxs, ok := p.byBase[key]; ok {
+			for _, i := range idxs {
+				mark(strings.ToLower(p.items[i].Address))
 			}
-			// Registered alias equals expanded alias address.
-			if addr == key {
-				mark(addr)
-			}
+		}
+		// Registered exact alias address → already mark(key); also burn if
+		// it happens to be indexed as a base (base-only credentials).
+		if i, ok := p.byAddr[key]; ok {
+			base := mailboxBase(p.items[i])
+			// When history has the bare base equal to this address, byBase covers it.
+			// When history has a plus-alias, only that address is burned (same as before).
+			_ = base
 		}
 	}
 	if n > 0 {
-		p.saveState()
+		p.saveStateNowLocked()
 	}
 	return n
 }
@@ -464,29 +657,42 @@ func (p *Pool) MarkGraphDead(mb Mailbox) {
 	if base == "" {
 		base = key
 	}
-	mark := func(addr string) {
+	mark := func(addr, itemBase string) {
 		if addr == "" {
 			return
 		}
-		// Do not downgrade a successful used; force used for free/in_use/failed/token_invalid.
-		p.state[addr] = "used"
-	}
-	mark(key)
-	mark(base)
-	for _, item := range p.items {
-		addr := strings.ToLower(item.Address)
-		itemBase := strings.ToLower(strings.TrimSpace(item.BaseEmail))
 		if itemBase == "" {
 			itemBase = addr
 		}
-		sameBase := itemBase == base || addr == base || itemBase == key
-		sameRT := mb.RefreshToken != "" && item.RefreshToken == mb.RefreshToken
-		if sameBase || sameRT {
-			mark(addr)
-			mark(itemBase)
+		// Force used for free/in_use/failed/token_invalid (and keep used).
+		p.setStateLocked(addr, itemBase, "used")
+	}
+	mark(key, base)
+	mark(base, base)
+	// Same base group via index.
+	for _, i := range p.byBase[base] {
+		item := p.items[i]
+		mark(strings.ToLower(item.Address), mailboxBase(item))
+	}
+	if idxs, ok := p.byBase[key]; ok && key != base {
+		for _, i := range idxs {
+			item := p.items[i]
+			mark(strings.ToLower(item.Address), mailboxBase(item))
 		}
 	}
-	p.saveState()
+	// Same refresh_token on a different base (reseller stock share) — rare, full scan.
+	if mb.RefreshToken != "" {
+		for _, item := range p.items {
+			if item.RefreshToken != mb.RefreshToken {
+				continue
+			}
+			addr := strings.ToLower(item.Address)
+			itemBase := mailboxBase(item)
+			mark(addr, itemBase)
+			mark(itemBase, itemBase)
+		}
+	}
+	p.saveStateNowLocked()
 }
 
 // MarkTokenInvalid is kept as an alias of MarkGraphDead for clarity at call sites.
@@ -516,8 +722,8 @@ func (p *Pool) Release(mb Mailbox) {
 	defer p.mu.Unlock()
 	key := strings.ToLower(mb.Address)
 	if p.state[key] == "in_use" {
-		delete(p.state, key)
-		p.saveState()
+		p.setStateLocked(key, mailboxBase(mb), "")
+		p.scheduleSaveLocked()
 	}
 }
 

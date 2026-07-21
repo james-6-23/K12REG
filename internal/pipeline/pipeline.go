@@ -152,15 +152,23 @@ func Run(opt Options) (stats Stats, err error) {
 				}
 				// Permanent burns (cannot usefully retry this address):
 				//  - Graph token dead
-				//  - OpenAI user_already_exists (email already has an account)
+				//  - OpenAI identity dead: already exists / deleted / deactivated / disallowed
 				// Soft fails → free mailbox for retry.
 				switch {
 				case mail.IsGraphAuthPermanent(regErr):
 					opt.Pool.MarkGraphDead(mb)
 					opt.log("%s REGISTER FAIL (graph dead · marked used): %v", tag, regErr)
-				case register.IsEmailAlreadyRegistered(regErr):
-					opt.Pool.Mark(mb, true) // burn this alias only
-					opt.log("%s REGISTER FAIL (email already registered · marked used): %v", tag, regErr)
+				case register.IsEmailPermanentlyUnusable(regErr):
+					opt.Pool.Mark(mb, true) // burn this alias only — free would waste another OTP cycle
+					reason := "email unusable"
+					switch {
+					case register.IsEmailAlreadyRegistered(regErr):
+						reason = "email already registered"
+					case strings.Contains(strings.ToLower(regErr.Error()), "deleted") ||
+						strings.Contains(strings.ToLower(regErr.Error()), "deactivated"):
+						reason = "email deleted/deactivated"
+					}
+					opt.log("%s REGISTER FAIL (%s · marked used): %v", tag, reason, regErr)
 				default:
 					opt.Pool.Mark(mb, false) // release in_use → free again
 					opt.log("%s REGISTER FAIL (mailbox freed, not used): %v", tag, regErr)
@@ -567,6 +575,9 @@ func isRetryableRegister(err error) bool {
 		"domain likely banned", "turnstile.dx", "pool exhausted",
 		// Already waited full OTP window — re-running wastes another timeout.
 		"otp timeout after",
+		// Identity permanently unusable — proxy rotate will not help.
+		"deleted or deactivated", "has been deleted", "has been deactivated",
+		"you do not have an account because", "account is deactivated",
 	}
 	for _, k := range hard {
 		if strings.Contains(s, k) {

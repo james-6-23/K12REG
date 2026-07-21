@@ -333,13 +333,16 @@ func (r *RunManager) run(ctx context.Context, count *int, workspaceID, source st
 		r.emit(fmt.Sprintf("%s mail=%s · available=%d · ws=%s · @%s · quota=%d",
 			tag, mailName, pool.Available(), truncID(slot.WorkspaceID, 12),
 			orDash(slot.Domain), slot.Quota))
-		return pipeline.Run(pipeline.Options{
+		st, runErr := pipeline.Run(pipeline.Options{
 			Config:  slotCfg,
 			Proxies: proxies,
 			Pool:    pool,
 			Ctx:     ctx,
 			Log:     func(s string) { r.emit(s) },
 		})
+		// Debounced state may still be pending; flush so used/in_use survives process kill.
+		pool.FlushState()
+		return st, runErr
 	}
 
 	if !cfg.WorkspaceEnabled || len(slots) == 0 {

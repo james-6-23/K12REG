@@ -471,11 +471,47 @@ func IsEmailAlreadyRegistered(err error) bool {
 	if err == nil {
 		return false
 	}
-	s := strings.ToLower(err.Error())
+	return emailStatusIsAlreadyRegistered(err.Error())
+}
+
+// IsEmailPermanentlyUnusable is true when OpenAI will never accept this address
+// for a new signup (exists, deleted, deactivated, banned domain, etc.).
+// Callers must Mark the mailbox used — freeing it only wastes another OTP wait.
+func IsEmailPermanentlyUnusable(err error) bool {
+	if err == nil {
+		return false
+	}
+	s := err.Error()
+	return emailStatusIsAlreadyRegistered(s) || emailStatusIsDeletedOrDead(s) || emailStatusIsDisallowed(s)
+}
+
+func emailStatusIsAlreadyRegistered(s string) bool {
+	s = strings.ToLower(s)
 	return strings.Contains(s, "user_already_exists") ||
 		strings.Contains(s, "account already exists") ||
 		strings.Contains(s, "email_already") ||
-		strings.Contains(s, "already exists for this email")
+		strings.Contains(s, "already exists for this email") ||
+		strings.Contains(s, "already registered")
+}
+
+// OpenAI returns validate_otp 403 with this copy when the identity was deleted
+// or deactivated — not a flaky session. Retrying the same plus-alias never works.
+func emailStatusIsDeletedOrDead(s string) bool {
+	s = strings.ToLower(s)
+	return strings.Contains(s, "deleted or deactivated") ||
+		strings.Contains(s, "has been deleted") ||
+		strings.Contains(s, "has been deactivated") ||
+		strings.Contains(s, "account is deactivated") ||
+		strings.Contains(s, "account has been disabled") ||
+		strings.Contains(s, "you do not have an account because")
+}
+
+func emailStatusIsDisallowed(s string) bool {
+	s = strings.ToLower(s)
+	return strings.Contains(s, "registration_disallowed") ||
+		strings.Contains(s, "domain likely banned") ||
+		strings.Contains(s, "signup is disabled") ||
+		strings.Contains(s, "signups are disabled")
 }
 
 // platformAuthorize is the legacy Platform SPA OAuth authorize step.
@@ -604,7 +640,9 @@ func chatgptAuthorize(client *httpx.Client, email, deviceID, challenge string) e
 		q.Set("ext-passkey-client-capabilities", "01111")
 		q.Set("ext-oai-did", deviceID)
 		q.Set("auth_session_logging_id", authSessionLogID)
-		q.Set("screen_hint", "login_or_signup")
+		// Prefer signup: login_or_signup often routes deleted identities into a
+		// login OTP path that ends in validate 403 "deleted or deactivated".
+		q.Set("screen_hint", "signup")
 		q.Set("login_hint", email)
 		form := url.Values{}
 		form.Set("callbackUrl", ChatGPTBase+"/")
@@ -662,7 +700,8 @@ func buildAuthorizeURL(email, deviceID, challenge string, withPKCE bool) string 
 	q.Set("ext-passkey-client-capabilities", "01111")
 	q.Set("ext-oai-did", deviceID)
 	q.Set("auth_session_logging_id", randomUUID())
-	q.Set("screen_hint", "login_or_signup")
+	// Batch registration always wants create-account, not login-to-deleted.
+	q.Set("screen_hint", "signup")
 	q.Set("login_hint", email)
 	q.Set("ccaps", "login_methods")
 	q.Set("state", randomURLSafe(32))
@@ -719,6 +758,19 @@ func validateOTP(client *httpx.Client, code, deviceID, vmDir string) error {
 	if resp.StatusCode == 200 {
 		return nil
 	}
+	// Permanent identity failures: do not spend another Sentinel Node + POST.
+	// 403 "deleted or deactivated" / already-exists style bodies never recover with so-token.
+	if resp.StatusCode == 400 || resp.StatusCode == 403 || resp.StatusCode == 409 {
+		snip := httpx.DumpSnippet(resp.Body, 400)
+		if emailStatusIsDeletedOrDead(snip) || emailStatusIsAlreadyRegistered(snip) || emailStatusIsDisallowed(snip) {
+			return fmt.Errorf("validate_otp HTTP %d: %s", resp.StatusCode, snip)
+		}
+		// 409 invalid_state still falls through to sentinel retry below when useful,
+		// but invalid_state rarely needs so-token — re-auth path handles it.
+		if resp.StatusCode == 409 && isInvalidAuthState(fmt.Errorf("%s", snip)) {
+			return fmt.Errorf("validate_otp HTTP %d: %s", resp.StatusCode, snip)
+		}
+	}
 	b, err := sentinel.Build(client, deviceID, "authorize_continue", vmDir)
 	if err == nil {
 		headers["openai-sentinel-token"] = b.Token
@@ -733,7 +785,7 @@ func validateOTP(client *httpx.Client, code, deviceID, vmDir string) error {
 			return nil
 		}
 	}
-	return fmt.Errorf("validate_otp HTTP %d: %s", resp.StatusCode, httpx.DumpSnippet(resp.Body, 200))
+	return fmt.Errorf("validate_otp HTTP %d: %s", resp.StatusCode, httpx.DumpSnippet(resp.Body, 400))
 }
 
 func createAccount(client *httpx.Client, name, birth, deviceID, vmDir string) (continueURL, authCode string, err error) {
