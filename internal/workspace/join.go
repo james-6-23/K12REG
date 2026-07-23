@@ -6,10 +6,15 @@ import (
 	"net/url"
 	"os"
 	"strings"
+	"sync"
 	"time"
 
 	"k12reg/internal/httpx"
 )
+
+// One manager account: serialize approve so N workers don't stampede list/PATCH
+// and miss each other's invites (main cause of "approve timeout" under threads>3).
+var approveMuByAccount sync.Map // accountID → *sync.Mutex
 
 const ChatGPTBase = "https://chatgpt.com"
 
@@ -128,18 +133,59 @@ func LoadManagerSession(path string) (ManagerSession, error) {
 
 // RefreshAccessToken exchanges a refresh_token for a new access_token.
 // Tries ChatGPT Web client first (app_X8z…), then legacy Platform client.
+// Prefers auth.openai.com/api/accounts/oauth/token JSON (same as signup exchange).
 func RefreshAccessToken(refreshToken, proxy string) (accessToken string, err error) {
+	at, _, err := RefreshTokens(refreshToken, proxy)
+	return at, err
+}
+
+// RefreshTokens is like RefreshAccessToken but also returns a rotated refresh_token
+// when OpenAI issues one (caller should persist it).
+func RefreshTokens(refreshToken, proxy string) (accessToken, newRefresh string, err error) {
 	refreshToken = strings.TrimSpace(refreshToken)
 	if refreshToken == "" {
-		return "", fmt.Errorf("empty refresh_token")
+		return "", "", fmt.Errorf("empty refresh_token")
 	}
 	client, err := httpx.New(proxy)
 	if err != nil {
-		return "", err
+		return "", "", err
 	}
 	defer client.Close()
 
-	try := func(clientID string) (string, error) {
+	const webClient = "app_X8zY6vW2pQ9tR3dE7nK1jL5gH"
+	const platformClient = "app_2SKx67EdpoN0G6j64rFvigXD"
+
+	tryJSON := func(clientID string) (string, string, error) {
+		payload, _ := json.Marshal(map[string]string{
+			"client_id":     clientID,
+			"grant_type":    "refresh_token",
+			"refresh_token": refreshToken,
+		})
+		headers := map[string]string{
+			"accept":       "application/json",
+			"content-type": "application/json",
+			"origin":       "https://chatgpt.com",
+			"referer":      "https://chatgpt.com/",
+			"user-agent":   httpx.UserAgent,
+		}
+		resp, err := client.PostJSON("https://auth.openai.com/api/accounts/oauth/token", payload, headers, false)
+		if err != nil {
+			return "", "", err
+		}
+		if resp.StatusCode != 200 {
+			return "", "", fmt.Errorf("oauth refresh HTTP %d: %s", resp.StatusCode, httpx.DumpSnippet(resp.Body, 160))
+		}
+		var data map[string]any
+		_ = json.Unmarshal(resp.Body, &data)
+		at, _ := data["access_token"].(string)
+		rt, _ := data["refresh_token"].(string)
+		if strings.TrimSpace(at) == "" {
+			return "", "", fmt.Errorf("oauth refresh missing access_token")
+		}
+		return strings.TrimSpace(at), strings.TrimSpace(rt), nil
+	}
+
+	tryForm := func(clientID string) (string, string, error) {
 		form := url.Values{}
 		form.Set("client_id", clientID)
 		form.Set("grant_type", "refresh_token")
@@ -148,116 +194,252 @@ func RefreshAccessToken(refreshToken, proxy string) (accessToken string, err err
 			"Accept": "application/json",
 		})
 		if err != nil {
-			return "", err
+			return "", "", err
 		}
 		if resp.StatusCode != 200 {
-			return "", fmt.Errorf("oauth refresh HTTP %d: %s", resp.StatusCode, httpx.DumpSnippet(resp.Body, 160))
+			return "", "", fmt.Errorf("oauth refresh form HTTP %d: %s", resp.StatusCode, httpx.DumpSnippet(resp.Body, 160))
 		}
 		var data map[string]any
 		_ = json.Unmarshal(resp.Body, &data)
 		at, _ := data["access_token"].(string)
+		rt, _ := data["refresh_token"].(string)
 		if strings.TrimSpace(at) == "" {
-			return "", fmt.Errorf("oauth refresh missing access_token")
+			return "", "", fmt.Errorf("oauth refresh missing access_token")
 		}
-		return at, nil
+		return strings.TrimSpace(at), strings.TrimSpace(rt), nil
 	}
 
-	// Web client (new protocol) → Platform client (legacy accounts).
-	const webClient = "app_X8zY6vW2pQ9tR3dE7nK1jL5gH"
-	const platformClient = "app_2SKx67EdpoN0G6j64rFvigXD"
-	if at, e := try(webClient); e == nil {
-		return at, nil
-	} else {
-		err = e
+	var last error
+	for _, clientID := range []string{webClient, platformClient} {
+		if at, rt, e := tryJSON(clientID); e == nil {
+			return at, rt, nil
+		} else {
+			last = e
+		}
+		if at, rt, e := tryForm(clientID); e == nil {
+			return at, rt, nil
+		} else {
+			last = e
+		}
 	}
-	if at, e := try(platformClient); e == nil {
-		return at, nil
-	} else if err == nil {
-		err = e
+	return "", "", last
+}
+
+func managerApproveLock(accountID string) *sync.Mutex {
+	accountID = strings.TrimSpace(accountID)
+	if accountID == "" {
+		accountID = "_"
 	}
-	return "", err
+	v, _ := approveMuByAccount.LoadOrStore(accountID, &sync.Mutex{})
+	return v.(*sync.Mutex)
 }
 
 // ApproveByEmail lists pending requests and accepts the matching invite.
+// Concurrent workers sharing one manager are serialized per account id.
 func ApproveByEmail(mgr ManagerSession, email, proxy string, maxAttempts int) error {
 	if maxAttempts < 1 {
 		maxAttempts = 8
 	}
-	if maxAttempts > 12 {
-		maxAttempts = 12
+	if maxAttempts > 20 {
+		maxAttempts = 20
 	}
+	email = strings.ToLower(strings.TrimSpace(email))
+	accountID := strings.TrimSpace(mgr.AccountID)
+	if accountID == "" {
+		return fmt.Errorf("manager session missing account id")
+	}
+
+	// Serialize per manager: concurrent list+accept races miss invites under load.
+	mu := managerApproveLock(accountID)
+	mu.Lock()
+	defer mu.Unlock()
+
 	client, err := httpx.New(proxy)
 	if err != nil {
 		return err
 	}
 	defer client.Close()
 	client.SetTimeout(httpx.DefaultTimeout)
-	email = strings.ToLower(strings.TrimSpace(email))
-	accountID := mgr.AccountID
-	if accountID == "" {
-		return fmt.Errorf("manager session missing account id")
-	}
 
+	// Join → invite visibility often lags 1–3s; first poll too early burns an attempt.
+	time.Sleep(1200 * time.Millisecond)
+
+	var lastListErr error
 	for attempt := 0; attempt < maxAttempts; attempt++ {
-		items, err := listRequests(client, mgr, email)
-		if err == nil {
-			for _, it := range items {
-				got := strings.ToLower(strings.TrimSpace(str(it["email_address"])))
-				if got == "" {
-					got = strings.ToLower(strings.TrimSpace(str(it["email"])))
-				}
-				if got != email && !strings.Contains(got, email) && !strings.Contains(email, got) {
-					// plus-alias loose match
-					if !aliasMatch(email, got) {
-						continue
-					}
-				}
-				id := str(it["id"])
-				if id == "" {
+		items, err := findInviteItems(client, mgr, email)
+		if err != nil {
+			lastListErr = err
+		} else if id, got := matchInviteID(items, email); id != "" {
+			if err := acceptRequest(client, mgr, id); err != nil {
+				// Transient: invite may have been accepted by another path — re-list once.
+				if attempt+1 < maxAttempts {
+					time.Sleep(approveBackoff(attempt))
 					continue
 				}
-				if err := acceptRequest(client, mgr, id); err != nil {
-					return err
-				}
-				return nil
+				return err
 			}
+			_ = got
+			return nil
 		}
-		// Cap wait: 1.5s → 3s (was 2+attempt up to 13s each → ~90s pure sleep).
 		if attempt+1 < maxAttempts {
 			time.Sleep(approveBackoff(attempt))
 		}
 	}
+	if lastListErr != nil {
+		return fmt.Errorf("approve timeout for %s (last list: %v)", email, lastListErr)
+	}
 	return fmt.Errorf("approve timeout for %s", email)
 }
 
-// approveBackoff: short, capped delays between invite list polls.
+// approveBackoff: slightly longer early waits so invites can appear under concurrency.
 func approveBackoff(attempt int) time.Duration {
-	// 1.5s, 2s, 2.5s, 3s, 3s, …
-	d := 1500*time.Millisecond + time.Duration(attempt)*500*time.Millisecond
-	if d > 3*time.Second {
-		d = 3 * time.Second
+	// 1.2s, 1.8s, 2.4s, 3s, 3.5s, 4s cap
+	d := 1200*time.Millisecond + time.Duration(attempt)*600*time.Millisecond
+	if d > 4*time.Second {
+		d = 4 * time.Second
 	}
 	return d
+}
+
+// emailLocalBase strips plus-tag: "a+xyz@outlook.com" → "a".
+func emailLocalBase(email string) string {
+	email = strings.ToLower(strings.TrimSpace(email))
+	local, _, ok := strings.Cut(email, "@")
+	if !ok {
+		return email
+	}
+	return strings.Split(local, "+")[0]
+}
+
+func emailDomainPart(email string) string {
+	email = strings.ToLower(strings.TrimSpace(email))
+	_, d, ok := strings.Cut(email, "@")
+	if !ok {
+		return ""
+	}
+	return d
+}
+
+// inviteEmail extracts email fields from an invite item.
+func inviteEmail(it map[string]any) string {
+	for _, k := range []string{"email_address", "email", "invitee_email", "user_email"} {
+		if s := strings.ToLower(strings.TrimSpace(str(it[k]))); s != "" && strings.Contains(s, "@") {
+			return s
+		}
+	}
+	// Nested shapes.
+	if u, ok := it["user"].(map[string]any); ok {
+		if s := strings.ToLower(strings.TrimSpace(str(u["email"]))); s != "" {
+			return s
+		}
+	}
+	return ""
+}
+
+// emailMatch: exact, plus-alias base, or contains — case-insensitive.
+func emailMatch(want, got string) bool {
+	want = strings.ToLower(strings.TrimSpace(want))
+	got = strings.ToLower(strings.TrimSpace(got))
+	if want == "" || got == "" {
+		return false
+	}
+	if want == got {
+		return true
+	}
+	if strings.Contains(got, want) || strings.Contains(want, got) {
+		return true
+	}
+	return aliasMatch(want, got)
 }
 
 func aliasMatch(a, b string) bool {
 	if a == "" || b == "" {
 		return false
 	}
-	al, _, _ := strings.Cut(a, "@")
-	bl, _, _ := strings.Cut(b, "@")
-	al = strings.Split(al, "+")[0]
-	bl = strings.Split(bl, "+")[0]
-	return al != "" && al == bl
+	al := emailLocalBase(a)
+	bl := emailLocalBase(b)
+	if al == "" || al != bl {
+		return false
+	}
+	// Same mailbox base; domain should match when both present.
+	da, db := emailDomainPart(a), emailDomainPart(b)
+	if da != "" && db != "" && da != db {
+		return false
+	}
+	return true
+}
+
+func matchInviteID(items []map[string]any, email string) (id, matchedEmail string) {
+	for _, it := range items {
+		got := inviteEmail(it)
+		if !emailMatch(email, got) {
+			continue
+		}
+		id = str(it["id"])
+		if id == "" {
+			continue
+		}
+		return id, got
+	}
+	return "", ""
+}
+
+// findInviteItems tries several list queries: full email, local@domain base,
+// bare local base, then unfiltered recent page (concurrency-safe matching).
+func findInviteItems(client *httpx.Client, mgr ManagerSession, email string) ([]map[string]any, error) {
+	email = strings.ToLower(strings.TrimSpace(email))
+	base := emailLocalBase(email)
+	dom := emailDomainPart(email)
+	queries := []string{email}
+	if base != "" && dom != "" {
+		queries = append(queries, base+"@"+dom)
+	}
+	if base != "" {
+		queries = append(queries, base)
+	}
+	queries = append(queries, "") // full recent list
+
+	var all []map[string]any
+	seen := map[string]bool{}
+	var lastErr error
+	for _, q := range queries {
+		items, err := listRequests(client, mgr, q)
+		if err != nil {
+			lastErr = err
+			continue
+		}
+		for _, it := range items {
+			id := str(it["id"])
+			key := id
+			if key == "" {
+				key = inviteEmail(it)
+			}
+			if key == "" || seen[key] {
+				continue
+			}
+			seen[key] = true
+			all = append(all, it)
+		}
+		// Fast path: already have a match.
+		if id, _ := matchInviteID(items, email); id != "" {
+			return all, nil
+		}
+	}
+	if len(all) == 0 && lastErr != nil {
+		return nil, lastErr
+	}
+	return all, nil
 }
 
 func listRequests(client *httpx.Client, mgr ManagerSession, query string) ([]map[string]any, error) {
 	q := url.Values{}
-	q.Set("include_pending", "false")
+	q.Set("include_pending", "true")
 	q.Set("include_requests", "true")
 	q.Set("offset", "0")
-	q.Set("limit", "25")
-	q.Set("query", query)
+	q.Set("limit", "50")
+	if strings.TrimSpace(query) != "" {
+		q.Set("query", query)
+	}
 	u := fmt.Sprintf("%s/backend-api/accounts/%s/invites?%s", ChatGPTBase, mgr.AccountID, q.Encode())
 	headers := managerHeaders(mgr, fmt.Sprintf("/backend-api/accounts/%s/invites", mgr.AccountID))
 	resp, err := client.Get(u, headers, false)
@@ -265,12 +447,24 @@ func listRequests(client *httpx.Client, mgr ManagerSession, query string) ([]map
 		return nil, err
 	}
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
-		return nil, fmt.Errorf("list invites HTTP %d", resp.StatusCode)
+		return nil, fmt.Errorf("list invites HTTP %d: %s", resp.StatusCode, httpx.DumpSnippet(resp.Body, 120))
 	}
 	var data struct {
 		Items []map[string]any `json:"items"`
 	}
-	_ = json.Unmarshal(resp.Body, &data)
+	if err := json.Unmarshal(resp.Body, &data); err != nil {
+		// Some responses wrap differently.
+		var alt map[string]any
+		if json.Unmarshal(resp.Body, &alt) == nil {
+			if raw, ok := alt["items"].([]any); ok {
+				for _, r := range raw {
+					if m, ok := r.(map[string]any); ok {
+						data.Items = append(data.Items, m)
+					}
+				}
+			}
+		}
+	}
 	return data.Items, nil
 }
 

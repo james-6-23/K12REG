@@ -2,6 +2,7 @@
 import { computed, onMounted, ref } from 'vue'
 import { apiJSON, pillCls, planPillCls } from '../api'
 import type { AccountRow } from '../types'
+import { toastError, toastSuccess } from '../toast'
 
 const accounts = ref<AccountRow[]>([])
 const total = ref(0)
@@ -9,6 +10,11 @@ const offset = ref(0)
 const limit = ref(100)
 const loading = ref(false)
 const order = ref<'desc' | 'asc'>('desc')
+const codexBusy = ref(false)
+const importBusy = ref(false)
+const codexMsg = ref('')
+const codexFiles = ref<{ name: string; size: number }[]>([])
+const codexOutDir = ref('codex_auth')
 
 const page = computed(() => Math.floor(offset.value / limit.value) + 1)
 const pages = computed(() => Math.max(1, Math.ceil(total.value / limit.value)))
@@ -68,6 +74,105 @@ function download(name: string) {
   window.open('/api/download?name=' + encodeURIComponent(name), '_blank')
 }
 
+async function loadCodexFiles() {
+  try {
+    const data = await apiJSON<{
+      output_dir: string
+      files: { name: string; size: number }[]
+    }>('/api/codex-agent')
+    codexOutDir.value = data.output_dir || 'codex_auth'
+    codexFiles.value = (data.files || []).filter((f) => f.name.endsWith('.json') && f.name !== 'agents.jsonl')
+  } catch {
+    codexFiles.value = []
+  }
+}
+
+/** Batch: access_token.txt → Codex Agent Identity auth.json under data/codex_auth/ */
+async function generateCodexAgents(source: 'token_file' | 'accounts') {
+  if (codexBusy.value) return
+  codexBusy.value = true
+  codexMsg.value = ''
+  try {
+    const body =
+      source === 'token_file'
+        ? { from_access_token_file: true }
+        : { from_accounts: true }
+    const data = await apiJSON<{
+      total: number
+      success: number
+      failed: number
+      output_dir: string
+    }>('/api/codex-agent', {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify(body),
+    })
+    const msg = `Codex Agent：成功 ${data.success}/${data.total}，失败 ${data.failed} → data/${data.output_dir}/`
+    codexMsg.value = msg
+    if (data.success > 0) toastSuccess(msg)
+    else toastError(msg)
+    await loadCodexFiles()
+  } catch (e) {
+    const msg = (e as Error).message || 'Codex Agent 注册失败'
+    codexMsg.value = msg
+    toastError(msg)
+  } finally {
+    codexBusy.value = false
+  }
+}
+
+/** Push data/codex_auth/*.json → codex2api agent-identity/import endpoints */
+async function importCodexToAPI() {
+  if (importBusy.value) return
+  importBusy.value = true
+  codexMsg.value = ''
+  try {
+    const data = await apiJSON<{
+      file_count: number
+      import?: {
+        ok?: boolean
+        error?: string
+        results?: {
+          name: string
+          imported?: number
+          failed?: number
+          total?: number
+          error?: string
+          ok?: boolean
+        }[]
+      }
+    }>('/api/codex-agent/import', {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: '{}',
+    })
+    const imp = data.import
+    if (!imp) {
+      toastError('无导入结果')
+      return
+    }
+    if (imp.error) {
+      codexMsg.value = imp.error
+      toastError(imp.error)
+      return
+    }
+    const parts = (imp.results || []).map((r) => {
+      if (!r.ok) return `${r.name}: fail ${r.error || ''}`
+      return `${r.name}: +${r.imported ?? 0}/${r.total ?? 0}`
+    })
+    const msg = `Agent Identity 导入 ${data.file_count} 个文件 · ${parts.join(' · ') || 'ok'}`
+    codexMsg.value = msg
+    if (imp.ok) toastSuccess(msg)
+    else toastError(msg)
+  } catch (e) {
+    const msg = (e as Error).message || '导入失败'
+    codexMsg.value = msg
+    toastError(msg)
+  } finally {
+    importBusy.value = false
+  }
+}
+
 /** Format created_at for the results table. */
 function formatTime(raw?: string | null) {
   if (!raw) return '—'
@@ -87,7 +192,10 @@ function formatTime(raw?: string | null) {
   }
 }
 
-onMounted(loadAccounts)
+onMounted(() => {
+  loadAccounts()
+  loadCodexFiles()
+})
 </script>
 
 <template>
@@ -104,6 +212,42 @@ onMounted(loadAccounts)
       </button>
       <button type="button" class="btn btn-ghost btn-sm" @click="download('registered_accounts.jsonl')">
         导出 JSONL
+      </button>
+      <button
+        type="button"
+        class="btn btn-ghost btn-sm"
+        :disabled="codexBusy"
+        title="从 access_token.txt 批量注册 Codex Agent Identity"
+        @click="generateCodexAgents('token_file')"
+      >
+        {{ codexBusy ? 'Codex…' : 'Codex Agent (token 文件)' }}
+      </button>
+      <button
+        type="button"
+        class="btn btn-ghost btn-sm"
+        :disabled="codexBusy"
+        title="从已保存账号的 access_token 批量注册"
+        @click="generateCodexAgents('accounts')"
+      >
+        Codex Agent (账号库)
+      </button>
+      <button
+        v-if="codexFiles.length"
+        type="button"
+        class="btn btn-ghost btn-sm"
+        title="下载 agents.jsonl 汇总"
+        @click="download(codexOutDir + '/agents.jsonl')"
+      >
+        下载 agents.jsonl ({{ codexFiles.length }})
+      </button>
+      <button
+        type="button"
+        class="btn btn-ghost btn-sm"
+        :disabled="importBusy || !codexFiles.length"
+        title="将 codex_auth/*.json 批量推送到 mode=agent_identity 的导入 API"
+        @click="importCodexToAPI"
+      >
+        {{ importBusy ? '导入中…' : '推送到 codex2api' }}
       </button>
 
       <div class="ml-auto flex flex-wrap items-center gap-1.5">

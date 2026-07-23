@@ -124,6 +124,8 @@ func (s *Server) routes() {
 	s.mux.HandleFunc("/api/tasks", s.handleTasks)
 	s.mux.HandleFunc("/api/workspace/join-owner", s.handleJoinOwner)
 	s.mux.HandleFunc("/api/workspace/parse-session", s.handleParseSession)
+	s.mux.HandleFunc("/api/codex-agent", s.handleCodexAgent)
+	s.mux.HandleFunc("/api/codex-agent/import", s.handleCodexAgent)
 	s.mux.HandleFunc("/", s.handleStatic)
 }
 
@@ -267,10 +269,35 @@ func (s *Server) listFiles() []map[string]any {
 
 func (s *Server) safePath(name string) (string, error) {
 	name = strings.TrimSpace(name)
-	if name == "" || strings.Contains(name, "/") || strings.Contains(name, "\\") || strings.HasPrefix(name, ".") {
+	if name == "" {
 		return "", fmt.Errorf("非法文件名")
 	}
-	p := filepath.Join(s.opt.DataDir, name)
+	// Normalize separators; reject absolute paths and any ".." segment.
+	name = filepath.ToSlash(name)
+	if strings.HasPrefix(name, "/") || strings.HasPrefix(name, "\\") {
+		return "", fmt.Errorf("非法文件名")
+	}
+	// Windows drive letter
+	if len(name) >= 2 && name[1] == ':' {
+		return "", fmt.Errorf("非法文件名")
+	}
+	parts := strings.Split(name, "/")
+	for _, p := range parts {
+		if p == "" || p == "." || p == ".." || strings.HasPrefix(p, ".") {
+			return "", fmt.Errorf("非法文件名")
+		}
+	}
+	// Top-level only, or one level under allowlisted dirs (e.g. codex_auth/email.json).
+	if len(parts) > 2 {
+		return "", fmt.Errorf("非法文件名")
+	}
+	if len(parts) == 2 {
+		allowedSub := map[string]bool{"codex_auth": true}
+		if !allowedSub[parts[0]] {
+			return "", fmt.Errorf("非法文件名")
+		}
+	}
+	p := filepath.Join(s.opt.DataDir, filepath.FromSlash(name))
 	abs, err := filepath.Abs(p)
 	if err != nil {
 		return "", err

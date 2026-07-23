@@ -47,6 +47,12 @@ func getEffectiveSettings(dataDir string) map[string]any {
 			"wait_timeout":   30,
 			"wait_interval":  1.5,
 		},
+		// Codex Agent Identity: after live AT, register agent → data/codex_auth/
+		"codex_agent": map[string]any{
+			"enabled":     false,
+			"verify_task": true,
+			"output_dir":  "codex_auth",
+		},
 	}
 	deepMerge(out, extractCurated(ov))
 	// mailboxes_file / alias_count may live under mail.providers[0]
@@ -83,6 +89,21 @@ func extractCurated(ov map[string]any) map[string]any {
 	out := map[string]any{}
 	if m, ok := ov["import_api"].(map[string]any); ok {
 		out["import_api"] = normalizeImportAPI(m)
+	}
+	if m, ok := ov["codex_agent"].(map[string]any); ok {
+		outDir := orStr(asString(m["output_dir"]), "codex_auth")
+		if outDir == "" {
+			outDir = "codex_auth"
+		}
+		verify := true
+		if v, ok := m["verify_task"].(bool); ok {
+			verify = v
+		}
+		out["codex_agent"] = map[string]any{
+			"enabled":     m["enabled"] == true,
+			"verify_task": verify,
+			"output_dir":  outDir,
+		}
 	}
 	if m, ok := ov["registration"].(map[string]any); ok {
 		oauthPath := orStr(asString(m["oauth_path"]), "")
@@ -253,6 +274,26 @@ func sanitizeForm(in map[string]any) map[string]any {
 	out := map[string]any{}
 	if m, ok := in["import_api"].(map[string]any); ok {
 		out["import_api"] = sanitizeImportAPI(m)
+	}
+	if m, ok := in["codex_agent"].(map[string]any); ok {
+		outDir := strings.TrimSpace(asString(m["output_dir"]))
+		if outDir == "" {
+			outDir = "codex_auth"
+		}
+		// Prevent path traversal in output_dir (relative name only).
+		outDir = filepath.Base(outDir)
+		if outDir == "." || outDir == ".." || outDir == "/" {
+			outDir = "codex_auth"
+		}
+		verify := true
+		if v, ok := m["verify_task"].(bool); ok {
+			verify = v
+		}
+		out["codex_agent"] = map[string]any{
+			"enabled":     m["enabled"] == true,
+			"verify_task": verify,
+			"output_dir":  outDir,
+		}
 	}
 	if m, ok := in["registration"].(map[string]any); ok {
 		oauthPath := orStr(asString(m["oauth_path"]), "")
@@ -449,6 +490,8 @@ func normalizeImportAPI(m map[string]any) map[string]any {
 				"url":         asString(em["url"]),
 				"admin_key":   asString(em["admin_key"]),
 				"require_k12": asBool(em["require_k12"], reqK12),
+				"mode":        normalizeImportMode(asString(em["mode"])),
+				"proxy_url":   asString(em["proxy_url"]),
 			})
 		}
 	} else if url := asString(m["url"]); url != "" {
@@ -459,11 +502,22 @@ func normalizeImportAPI(m map[string]any) map[string]any {
 			"url":         url,
 			"admin_key":   asString(m["admin_key"]),
 			"require_k12": reqK12,
+			"mode":        normalizeImportMode(asString(m["mode"])),
+			"proxy_url":   asString(m["proxy_url"]),
 		})
 	}
 	return map[string]any{
 		"require_k12": reqK12,
 		"endpoints":   eps,
+	}
+}
+
+func normalizeImportMode(s string) string {
+	switch strings.ToLower(strings.TrimSpace(s)) {
+	case "agent_identity", "agent", "agent-identity", "agentidentity", "codex_agent", "codex-agent":
+		return "agent_identity"
+	default:
+		return "at"
 	}
 }
 
@@ -490,6 +544,8 @@ func sanitizeImportAPI(m map[string]any) map[string]any {
 				"url":         url,
 				"admin_key":   asString(em["admin_key"]),
 				"require_k12": asBool(em["require_k12"], reqK12),
+				"mode":        normalizeImportMode(asString(em["mode"])),
+				"proxy_url":   strings.TrimSpace(asString(em["proxy_url"])),
 			})
 		}
 	}
@@ -502,6 +558,8 @@ func sanitizeImportAPI(m map[string]any) map[string]any {
 				"url":         url,
 				"admin_key":   asString(m["admin_key"]),
 				"require_k12": reqK12,
+				"mode":        normalizeImportMode(asString(m["mode"])),
+				"proxy_url":   strings.TrimSpace(asString(m["proxy_url"])),
 			})
 		}
 	}

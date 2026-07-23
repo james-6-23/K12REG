@@ -89,6 +89,14 @@ export interface ImportEndpoint {
   url: string
   admin_key: string
   require_k12: boolean
+  /**
+   * Import payload mode for codex2api (or compatible):
+   * - at — POST /api/admin/accounts/at {access_token}
+   * - agent_identity — POST .../codex/agent-identity (auth.json)
+   */
+  mode: 'at' | 'agent_identity' | string
+  /** Optional proxy_url stored on gateway account (agent_identity only). */
+  proxy_url?: string
 }
 
 export interface ImportApiSettings {
@@ -164,12 +172,23 @@ export interface MailSettings {
   wait_interval: number
 }
 
+/** Codex Agent Identity registration (auth.openai.com → Codex CLI auth.json). */
+export interface CodexAgentSettings {
+  /** Auto-register during pipeline when live AT is written. */
+  enabled: boolean
+  /** Optional signed task/register verify step. */
+  verify_task: boolean
+  /** Output dir under data/ (default codex_auth). */
+  output_dir: string
+}
+
 export interface Settings {
   import_api: ImportApiSettings
   registration: RegistrationSettings
   workspace: WorkspaceSettings
   proxy: ProxySettings
   mail: MailSettings
+  codex_agent: CodexAgentSettings
 }
 
 export interface DataFile {
@@ -202,6 +221,8 @@ export function emptyImportEndpoint(i = 1): ImportEndpoint {
     url: '',
     admin_key: '',
     require_k12: true,
+    mode: 'agent_identity',
+    proxy_url: '',
   }
 }
 
@@ -290,11 +311,34 @@ export function defaultSettings(): Settings {
     },
     proxy: { proxies_file: '', default_protocol: 'socks5', flaresolverr_url: '' },
     mail: { mailboxes_file: '', alias_count: 1, wait_timeout: 30, wait_interval: 1.5 },
+    codex_agent: {
+      enabled: false,
+      verify_task: true,
+      output_dir: 'codex_auth',
+    },
   }
 }
 
 export function defaultRunStatus(): RunStatus {
   return { running: false, pid: null, elapsed: null, exit_code: null }
+}
+
+function normalizeImportMode(raw: unknown): 'at' | 'agent_identity' {
+  const s = String(raw || '')
+    .trim()
+    .toLowerCase()
+  if (
+    s === 'agent_identity' ||
+    s === 'agent' ||
+    s === 'agent-identity' ||
+    s === 'agentidentity' ||
+    s === 'codex_agent' ||
+    s === 'codex-agent'
+  ) {
+    return 'agent_identity'
+  }
+  // Missing / at / access_token → legacy AT import (backward compatible).
+  return 'at'
 }
 
 /** Normalize API payload that may still be legacy single-url shape. */
@@ -311,6 +355,8 @@ export function normalizeImportApi(raw: unknown): ImportApiSettings {
         url: String(e.url || ''),
         admin_key: String(e.admin_key || ''),
         require_k12: e.require_k12 !== undefined ? !!e.require_k12 : reqK12,
+        mode: normalizeImportMode(e.mode),
+        proxy_url: String(e.proxy_url || ''),
       }
     })
   } else if (m.url) {
@@ -321,6 +367,8 @@ export function normalizeImportApi(raw: unknown): ImportApiSettings {
         url: String(m.url || ''),
         admin_key: String(m.admin_key || ''),
         require_k12: reqK12,
+        mode: normalizeImportMode(m.mode),
+        proxy_url: String(m.proxy_url || ''),
       },
     ]
   }

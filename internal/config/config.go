@@ -61,6 +61,12 @@ type Config struct {
 
 	// Paths for sentinel VM (Node)
 	SentinelVMDir string
+
+	// Codex Agent Identity (auth.openai.com /v1/agent/register → Codex CLI auth.json)
+	CodexAgentEnabled    bool
+	CodexAgentVerifyTask bool
+	// CodexAgentOutputDir is relative to DataDir (default: codex_auth).
+	CodexAgentOutputDir string
 }
 
 // ImportEndpoint is one account-pool admin API target.
@@ -70,6 +76,11 @@ type ImportEndpoint struct {
 	URL        string
 	AdminKey   string
 	RequireK12 bool
+	// Mode: "at" (access_token) | "agent_identity" (Codex Agent Identity auth.json).
+	// See AGENT_IDENTITY_IMPORT.md for agent_identity gateway paths.
+	Mode string
+	// ProxyURL is optional proxy_url stored on the gateway account (agent_identity only).
+	ProxyURL string
 }
 
 // ManagerSlot is one mother session / workspace to fill during a batch run.
@@ -100,11 +111,14 @@ func Default() Config {
 		WorkspaceRoute:       "request",
 		ApproveRequests:      true,
 		ManagerSessionFile:   "hotsession.json",
-		ApproveMaxAttempts:   8, // short backoff; ~12–20s list poll budget
+		ApproveMaxAttempts:   10, // serialized per manager; multi-query list + backoff
 		RequireSameDomain:    true,
 		MailBinding:          "shared",
 		ImportRequireK12:     true,
 		OAuthPath:            "chatgpt_web",
+		CodexAgentEnabled:    false,
+		CodexAgentVerifyTask: true,
+		CodexAgentOutputDir:  "codex_auth",
 	}
 }
 
@@ -283,6 +297,8 @@ func (c *Config) ApplyMap(raw map[string]any) {
 					URL:        strings.TrimSpace(asStringAny(em["url"])),
 					AdminKey:   strings.TrimSpace(asStringAny(em["admin_key"])),
 					RequireK12: c.ImportRequireK12,
+					Mode:       strings.TrimSpace(asStringAny(em["mode"])),
+					ProxyURL:   strings.TrimSpace(asStringAny(em["proxy_url"])),
 				}
 				if v, ok := em["enabled"].(bool); ok {
 					ep.Enabled = v
@@ -313,6 +329,8 @@ func (c *Config) ApplyMap(raw map[string]any) {
 					URL:        url,
 					AdminKey:   key,
 					RequireK12: c.ImportRequireK12,
+					Mode:       strings.TrimSpace(asStringAny(m["mode"])),
+					ProxyURL:   strings.TrimSpace(asStringAny(m["proxy_url"])),
 				}}
 			}
 		}
@@ -333,6 +351,8 @@ func (c *Config) ApplyMap(raw map[string]any) {
 				URL:        strings.TrimSpace(asStringAny(em["url"])),
 				AdminKey:   strings.TrimSpace(asStringAny(em["admin_key"])),
 				RequireK12: c.ImportRequireK12,
+				Mode:       strings.TrimSpace(asStringAny(em["mode"])),
+				ProxyURL:   strings.TrimSpace(asStringAny(em["proxy_url"])),
 			}
 			if v, ok := em["enabled"].(bool); ok {
 				ep.Enabled = v
@@ -349,6 +369,17 @@ func (c *Config) ApplyMap(raw map[string]any) {
 			c.ImportEndpoints = append(c.ImportEndpoints, ep)
 		}
 		c.syncImportLegacy()
+	}
+	if m, ok := raw["codex_agent"].(map[string]any); ok {
+		if v, ok := m["enabled"].(bool); ok {
+			c.CodexAgentEnabled = v
+		}
+		if v, ok := m["verify_task"].(bool); ok {
+			c.CodexAgentVerifyTask = v
+		}
+		if v, ok := m["output_dir"].(string); ok && strings.TrimSpace(v) != "" {
+			c.CodexAgentOutputDir = strings.TrimSpace(v)
+		}
 	}
 }
 

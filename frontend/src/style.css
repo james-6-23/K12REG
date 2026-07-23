@@ -184,26 +184,39 @@ html.light {
     background: var(--app-input);
     color: var(--app-heading);
   }
-  /* Native <select>: avoid double-pill / system menu stacking on macOS */
+  /*
+   * Native <select>: strip system chevron completely, single custom arrow.
+   * Use background-color (not shorthand) so focus never wipes the SVG layer.
+   * Do not use !px-* on selects — it kills pr-9 and stacks arrows under text.
+   */
   select.field {
-    @apply cursor-pointer appearance-none pr-9;
+    @apply cursor-pointer pr-9;
+    -webkit-appearance: none;
+    -moz-appearance: none;
+    appearance: none;
+    /* color + image as one stack — survives focus recolors */
+    background-color: var(--app-input);
     background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' fill='none' viewBox='0 0 24 24' stroke='%2394a3b8'%3E%3Cpath stroke-linecap='round' stroke-linejoin='round' stroke-width='2' d='M19 9l-7 7-7-7'/%3E%3C/svg%3E");
     background-repeat: no-repeat;
-    background-position: right 0.65rem center;
-    background-size: 1rem;
+    background-position: right 0.55rem center;
+    background-size: 0.95rem 0.95rem;
   }
-  select.field:focus {
-    background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' fill='none' viewBox='0 0 24 24' stroke='%233b82f6'%3E%3Cpath stroke-linecap='round' stroke-linejoin='round' stroke-width='2' d='M19 9l-7 7-7-7'/%3E%3C/svg%3E");
+  select.field::-ms-expand {
+    display: none;
   }
   .field::placeholder {
     color: var(--app-faint);
   }
   .field:focus {
     @apply border-blue-500/60 ring-2 ring-blue-500/20;
-    background: var(--app-surface-solid);
+    background-color: var(--app-surface-solid);
   }
   select.field:focus {
     background-color: var(--app-surface-solid);
+    background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' fill='none' viewBox='0 0 24 24' stroke='%233b82f6'%3E%3Cpath stroke-linecap='round' stroke-linejoin='round' stroke-width='2' d='M19 9l-7 7-7-7'/%3E%3C/svg%3E");
+    background-repeat: no-repeat;
+    background-position: right 0.55rem center;
+    background-size: 0.95rem 0.95rem;
   }
   .tab-btn {
     @apply relative rounded-lg px-3.5 py-1.5 text-sm font-medium transition;

@@ -1,14 +1,18 @@
 package main
 
 import (
+	"bufio"
+	"encoding/json"
 	"flag"
 	"fmt"
 	"log"
 	"net/http"
 	"os"
 	"path/filepath"
+	"strings"
 	"time"
 
+	"k12reg/internal/codexagent"
 	"k12reg/internal/config"
 	"k12reg/internal/mail"
 	"k12reg/internal/pipeline"
@@ -17,10 +21,17 @@ import (
 )
 
 func main() {
-	if len(os.Args) > 1 && os.Args[1] == "serve" {
-		os.Args = append([]string{os.Args[0]}, os.Args[2:]...)
-		runServe()
-		return
+	if len(os.Args) > 1 {
+		switch os.Args[1] {
+		case "serve":
+			os.Args = append([]string{os.Args[0]}, os.Args[2:]...)
+			runServe()
+			return
+		case "codex-agent", "codex_agent":
+			os.Args = append([]string{os.Args[0]}, os.Args[2:]...)
+			runCodexAgent()
+			return
+		}
 	}
 	runCLI()
 }
@@ -73,9 +84,11 @@ func runCLI() {
 	)
 	flag.Usage = func() {
 		fmt.Fprintf(os.Stderr, "Usage:\n")
-		fmt.Fprintf(os.Stderr, "  k12reg serve [flags]     # Go web control panel\n")
-		fmt.Fprintf(os.Stderr, "  k12reg [flags]           # CLI pipeline\n\n")
-		fmt.Fprintf(os.Stderr, "Serve flags: k12reg serve -h\nCLI flags:\n")
+		fmt.Fprintf(os.Stderr, "  k12reg serve [flags]          # Go web control panel\n")
+		fmt.Fprintf(os.Stderr, "  k12reg codex-agent [flags]    # Codex Agent Identity from AT\n")
+		fmt.Fprintf(os.Stderr, "  k12reg [flags]                # CLI pipeline\n\n")
+		fmt.Fprintf(os.Stderr, "Serve flags: k12reg serve -h\n")
+		fmt.Fprintf(os.Stderr, "Codex agent: k12reg codex-agent -h\nCLI flags:\n")
 		flag.PrintDefaults()
 	}
 	flag.Parse()
@@ -215,6 +228,163 @@ func findStatic() string {
 		}
 	}
 	return filepath.Join("frontend", "dist")
+}
+
+// runCodexAgent registers Codex CLI agent_identity auth.json from access tokens.
+// Port of Tool/codex-agent/codex_agent.py.
+func runCodexAgent() {
+	fs := flag.NewFlagSet("codex-agent", flag.ExitOnError)
+	dataDir := fs.String("data", envOr("K12_DATA_DIR", "."), "data directory")
+	token := fs.String("token", "", "ChatGPT session JWT (accessToken)")
+	file := fs.String("file", "", "JSON with accessToken, or plain access_token.txt (one JWT per line)")
+	output := fs.String("output", "", "single-token output path (default: <data>/codex_auth/<email>.json)")
+	fromAccounts := fs.Bool("from-accounts", false, "use access_token from registered_accounts.jsonl")
+	fromTokenFile := fs.Bool("from-access-token-file", false, "read data/access_token.txt")
+	proxy := fs.String("proxy", "", "proxy URL")
+	noVerify := fs.Bool("no-verify", false, "skip task registration verify")
+	outDir := fs.String("out-dir", "codex_auth", "output directory under data (batch mode)")
+	_ = fs.Parse(os.Args[1:])
+
+	dataAbs, _ := filepath.Abs(*dataDir)
+	var tokens []string
+	add := func(t string) {
+		t = strings.TrimSpace(t)
+		if t == "" || strings.HasPrefix(t, "#") {
+			return
+		}
+		tokens = append(tokens, t)
+	}
+
+	if *token != "" {
+		add(*token)
+	}
+	if *file != "" {
+		b, err := os.ReadFile(*file)
+		if err != nil {
+			log.Fatalf("read file: %v", err)
+		}
+		// Try JSON first
+		var data map[string]any
+		if json.Unmarshal(b, &data) == nil {
+			if v, _ := data["accessToken"].(string); v != "" {
+				add(v)
+			} else if v, _ := data["access_token"].(string); v != "" {
+				add(v)
+			} else {
+				log.Fatalf("JSON file has no accessToken / access_token")
+			}
+		} else {
+			sc := bufio.NewScanner(strings.NewReader(string(b)))
+			sc.Buffer(make([]byte, 0, 64*1024), 4*1024*1024)
+			for sc.Scan() {
+				add(sc.Text())
+			}
+		}
+	}
+	if *fromTokenFile {
+		p := filepath.Join(dataAbs, "access_token.txt")
+		f, err := os.Open(p)
+		if err != nil {
+			log.Fatalf("open access_token.txt: %v", err)
+		}
+		sc := bufio.NewScanner(f)
+		sc.Buffer(make([]byte, 0, 64*1024), 4*1024*1024)
+		for sc.Scan() {
+			add(sc.Text())
+		}
+		_ = f.Close()
+	}
+	if *fromAccounts {
+		path := storage.AccountsFile(dataAbs)
+		f, err := os.Open(path)
+		if err != nil {
+			log.Fatalf("open accounts: %v", err)
+		}
+		sc := bufio.NewScanner(f)
+		sc.Buffer(make([]byte, 0, 256*1024), 8*1024*1024)
+		for sc.Scan() {
+			line := sc.Bytes()
+			if len(line) == 0 {
+				continue
+			}
+			var raw map[string]any
+			if json.Unmarshal(line, &raw) != nil {
+				continue
+			}
+			if v, _ := raw["access_token"].(string); v != "" {
+				add(v)
+			}
+		}
+		_ = f.Close()
+	}
+
+	// Interactive if nothing provided
+	if len(tokens) == 0 {
+		fmt.Println("请输入 ChatGPT session JWT (accessToken)：")
+		fmt.Println("（或使用 --token / --file / --from-access-token-file / --from-accounts）")
+		sc := bufio.NewScanner(os.Stdin)
+		if sc.Scan() {
+			add(sc.Text())
+		}
+	}
+	if len(tokens) == 0 {
+		log.Fatal("未提供 access_token")
+	}
+
+	// Dedupe
+	seen := map[string]struct{}{}
+	var unique []string
+	for _, t := range tokens {
+		if _, ok := seen[t]; ok {
+			continue
+		}
+		seen[t] = struct{}{}
+		unique = append(unique, t)
+	}
+	tokens = unique
+
+	dir := filepath.Join(dataAbs, filepath.Base(*outDir))
+	if *outDir == "" {
+		dir = filepath.Join(dataAbs, "codex_auth")
+	}
+	verify := !*noVerify
+	okN, failN := 0, 0
+
+	fmt.Printf("codex-agent · tokens=%d · out=%s · verify=%v\n", len(tokens), dir, verify)
+
+	for i, tok := range tokens {
+		auth, err := codexagent.Create(codexagent.Options{
+			AccessToken: tok,
+			Proxy:       *proxy,
+			VerifyTask:  verify,
+		})
+		if err != nil {
+			fmt.Printf("[%d/%d] FAIL · %v\n", i+1, len(tokens), err)
+			failN++
+			continue
+		}
+		base := codexagent.SafeFilename(auth.AgentIdentity.Email)
+		if base == "unknown" {
+			base = codexagent.SafeFilename(auth.AgentIdentity.AccountID)
+		}
+		path := *output
+		if path == "" || len(tokens) > 1 {
+			path = filepath.Join(dir, base+".json")
+		}
+		if err := codexagent.WriteAuthJSON(path, auth); err != nil {
+			fmt.Printf("[%d/%d] FAIL write · %v\n", i+1, len(tokens), err)
+			failN++
+			continue
+		}
+		_ = codexagent.AppendAuthJSONL(filepath.Join(dir, "agents.jsonl"), auth)
+		fmt.Printf("[%d/%d] OK · %s · runtime=%s · %s\n",
+			i+1, len(tokens), auth.AgentIdentity.Email, auth.AgentIdentity.AgentRuntimeID, path)
+		okN++
+	}
+	fmt.Printf("── summary · ok=%d fail=%d ──\n", okN, failN)
+	if failN > 0 && okN == 0 {
+		os.Exit(1)
+	}
 }
 
 func findSentinelVM() string {

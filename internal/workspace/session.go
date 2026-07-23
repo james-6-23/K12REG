@@ -46,6 +46,87 @@ func JWTIsWorkspaceScoped(accessToken string) bool {
 	return WorkspacePlans[JWTPlanType(accessToken)]
 }
 
+// IsTokenInvalidated reports OpenAI auth rejections that mean the AT is dead
+// (not a transient network blip). JWT may still decode with long exp.
+func IsTokenInvalidated(err error) bool {
+	if err == nil {
+		return false
+	}
+	s := strings.ToLower(err.Error())
+	return strings.Contains(s, "token_invalidated") ||
+		strings.Contains(s, "authentication token has been invalidated") ||
+		strings.Contains(s, "token has been revoked") ||
+		strings.Contains(s, "access token revoked")
+}
+
+// ProbeAccessToken performs a cheap authenticated call to verify the AT is
+// actually accepted (not merely a well-formed k12 JWT). Prefer chatgpt.com
+// accounts/check so ChatGPT-Account-ID workspace pins are exercised the same
+// way Codex / reverse-proxy stacks do.
+func ProbeAccessToken(accessToken, accountID, proxy string) error {
+	accessToken = strings.TrimSpace(accessToken)
+	if accessToken == "" {
+		return fmt.Errorf("empty access_token")
+	}
+	client, err := httpx.New(proxy)
+	if err != nil {
+		return err
+	}
+	defer client.Close()
+	client.SetTimeout(httpx.DefaultTimeout)
+
+	// 1) ChatGPT accounts/check (Codex-relevant host + account header).
+	u := ChatGPTBase + "/backend-api/accounts/check/v4-2023-04-27"
+	headers := map[string]string{
+		"authorization": "Bearer " + accessToken,
+		"accept":        "application/json",
+		"oai-language":  "en-US",
+		"referer":       ChatGPTBase + "/",
+		"user-agent":    httpx.UserAgent,
+	}
+	accountID = strings.TrimSpace(accountID)
+	if accountID == "" {
+		accountID = JWTAccountID(accessToken)
+	}
+	if accountID != "" {
+		headers["chatgpt-account-id"] = accountID
+		headers["ChatGPT-Account-ID"] = accountID
+	}
+	resp, err := client.Get(u, headers, false)
+	if err != nil {
+		// Fall through to api.openai.com models.
+	} else if resp.StatusCode == 200 {
+		return nil
+	} else {
+		snip := httpx.DumpSnippet(resp.Body, 220)
+		err = fmt.Errorf("accounts/check HTTP %d: %s", resp.StatusCode, snip)
+		if IsTokenInvalidated(err) || resp.StatusCode == 401 || resp.StatusCode == 403 {
+			return err
+		}
+	}
+
+	// 2) api.openai.com/v1/models — confirms API auth layer independently.
+	h2 := map[string]string{
+		"authorization": "Bearer " + accessToken,
+		"accept":        "application/json",
+		"user-agent":    httpx.UserAgent,
+	}
+	if accountID != "" {
+		h2["ChatGPT-Account-ID"] = accountID
+	}
+	resp2, err2 := client.Get("https://api.openai.com/v1/models", h2, false)
+	if err2 != nil {
+		if err != nil {
+			return err
+		}
+		return err2
+	}
+	if resp2.StatusCode == 200 {
+		return nil
+	}
+	return fmt.Errorf("models HTTP %d: %s", resp2.StatusCode, httpx.DumpSnippet(resp2.Body, 220))
+}
+
 // IsWorkspacePlan reports whether a plan_type string is k12/team/…
 func IsWorkspacePlan(plan string) bool {
 	return WorkspacePlans[strings.ToLower(strings.TrimSpace(plan))]

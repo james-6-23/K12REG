@@ -355,23 +355,16 @@ func ApproveByEmailAsOwner(mgr ManagerSession, email, proxy string, maxAttempts 
 		return ApproveResult{Error: "母号缺少 account id"}
 	}
 
+	// Share manager lock with pipeline ApproveByEmail (same stampede problem).
+	mu := managerApproveLock(mgr.AccountID)
+	mu.Lock()
+	defer mu.Unlock()
+
+	time.Sleep(800 * time.Millisecond)
 	for attempt := 0; attempt < maxAttempts; attempt++ {
-		items, err := listRequests(client, mgr, email)
+		items, err := findInviteItems(client, mgr, email)
 		if err == nil {
-			for _, it := range items {
-				got := strings.ToLower(strings.TrimSpace(str(it["email_address"])))
-				if got == "" {
-					got = strings.ToLower(strings.TrimSpace(str(it["email"])))
-				}
-				if got != email && !strings.Contains(got, email) && !strings.Contains(email, got) {
-					if !aliasMatch(email, got) {
-						continue
-					}
-				}
-				id := str(it["id"])
-				if id == "" {
-					continue
-				}
+			if id, got := matchInviteID(items, email); id != "" {
 				if err := patchInvite(client, mgr, id, asOwner); err != nil {
 					return ApproveResult{OK: false, InviteID: id, Email: got, Error: err.Error()}
 				}

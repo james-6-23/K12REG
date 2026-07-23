@@ -4,11 +4,13 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"path/filepath"
 	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
 
+	"k12reg/internal/codexagent"
 	"k12reg/internal/config"
 	"k12reg/internal/importapi"
 	"k12reg/internal/mail"
@@ -223,27 +225,30 @@ func Run(opt Options) (stats Stats, err error) {
 					atomic.AddInt64(&stats.JoinOK, 1)
 				}
 
+				approveOK := !cfg.ApproveRequests || !hasMgr
 				if hasMgr && cfg.ApproveRequests && joinStatus(joins) == "ok" {
 					opt.log("%s approve · %s …", tag, reg.Email)
 					if err := workspace.ApproveByEmail(mgr, reg.Email, proxy, cfg.ApproveMaxAttempts); err != nil {
 						opt.log("%s approve fail: %v", tag, err)
 						acc["approve_status"] = "failed"
+						approveOK = false
 					} else {
 						opt.log("%s approve ok", tag)
 						acc["approve_status"] = "ok"
+						approveOK = true
 						atomic.AddInt64(&stats.ApproveOK, 1)
-						// Membership propagation often needs 5–20s after PATCH.
-						if err := sleepCtx(ctx, 6*time.Second); err != nil {
+						// Membership propagation after PATCH.
+						if err := sleepCtx(ctx, 4*time.Second); err != nil {
 							return
 						}
 					}
 				} else if hasMgr && cfg.ApproveRequests {
 					acc["approve_status"] = "skipped"
+					approveOK = false
 				}
 
 				// Elevate → real k12 JWT via session cookie (not check-API label alone).
-				// Protocol/Web AT after register is usually free-scoped; join+approve
-				// only adds membership. Re-mint AT with account_id=workspace.
+				// Skip when approve failed — free JWT is guaranteed and wastes multi-pass time.
 				at := reg.AccessToken
 				st := reg.SessionToken
 				if st == "" {
@@ -254,13 +259,18 @@ func Run(opt Options) (stats Stats, err error) {
 					preferred = []string{activeWID}
 				}
 				elevatedOK := false
-				if joinStatus(joins) == "ok" && st != "" && len(preferred) > 0 {
-					for pass := 1; pass <= 3; pass++ {
+				canElevate := joinStatus(joins) == "ok" && st != "" && len(preferred) > 0 && approveOK
+				if joinStatus(joins) == "ok" && st != "" && len(preferred) > 0 && !approveOK && cfg.ApproveRequests {
+					acc["elevate_status"] = "skipped_no_approve"
+					opt.log("%s elevate skip · approve not ok (would stay free)", tag)
+				} else if canElevate {
+					maxPass := 2
+					for pass := 1; pass <= maxPass; pass++ {
 						if ctx.Err() != nil {
 							return
 						}
-						opt.log("%s elevate → k12 · pass %d/3 · ST=yes · ws=%s",
-							tag, pass, trunc(preferred[0], 10))
+						opt.log("%s elevate → k12 · pass %d/%d · ST=yes · ws=%s",
+							tag, pass, maxPass, trunc(preferred[0], 10))
 						fields, e := workspace.ElevateSession(st, preferred, proxy)
 						if e != nil {
 							opt.log("%s elevate fail · pass %d: %v", tag, pass, e)
@@ -282,7 +292,6 @@ func Run(opt Options) (stats Stats, err error) {
 							if fields.Expires != "" {
 								acc["expires"] = fields.Expires
 							}
-							// Success only when JWT carries workspace plan.
 							if workspace.JWTIsWorkspaceScoped(at) {
 								acc["workspace_scope"] = "elevated"
 								acc["elevate_status"] = "ok"
@@ -300,12 +309,12 @@ func Run(opt Options) (stats Stats, err error) {
 							}
 							opt.log("%s elevate AT but jwt still free · plan=%s", tag, fields.PlanType)
 						}
-						// Re-approve + wait (membership lag under concurrency).
-						if hasMgr && cfg.ApproveRequests {
-							_ = workspace.ApproveByEmail(mgr, reg.Email, proxy, 3)
-						}
-						if err := sleepCtx(ctx, time.Duration(pass)*4*time.Second); err != nil {
-							return
+						// Membership lag: light re-approve + short wait.
+						if pass < maxPass && hasMgr && cfg.ApproveRequests {
+							_ = workspace.ApproveByEmail(mgr, reg.Email, proxy, 2)
+							if err := sleepCtx(ctx, time.Duration(pass)*3*time.Second); err != nil {
+								return
+							}
 						}
 					}
 					if !elevatedOK {
@@ -315,12 +324,15 @@ func Run(opt Options) (stats Stats, err error) {
 				} else if joinStatus(joins) == "ok" && st == "" {
 					acc["elevate_status"] = "no_session"
 					opt.log("%s no session_token · cannot cookie-elevate · JWT stays free until ST exists", tag)
-					// RT refresh alone does not add chatgpt_plan_type=k12.
 					if reg.RefreshToken != "" {
-						if newAT, e := workspace.RefreshAccessToken(reg.RefreshToken, proxy); e == nil && newAT != "" {
+						if newAT, newRT, e := workspace.RefreshTokens(reg.RefreshToken, proxy); e == nil && newAT != "" {
 							at = newAT
 							reg.AccessToken = newAT
 							acc["access_token"] = newAT
+							if newRT != "" {
+								reg.RefreshToken = newRT
+								acc["refresh_token"] = newRT
+							}
 							opt.log("%s token refresh ok (still need ST for k12 JWT)", tag)
 						} else if e != nil {
 							opt.log("%s token refresh: %v", tag, e)
@@ -328,8 +340,75 @@ func Run(opt Options) (stats Stats, err error) {
 					}
 				}
 
+				// Live AT probe: JWT k12 alone is not enough for Codex — OpenAI may
+				// already have token_invalidated the session while the JWT still decodes.
+				aidHint := str(acc["chatgpt_account_id"])
+				if aidHint == "" {
+					aidHint = activeWID
+				}
+				tokenLive := false
+				if at != "" {
+					if pe := workspace.ProbeAccessToken(at, aidHint, proxy); pe == nil {
+						tokenLive = true
+						acc["token_status"] = "live"
+						opt.log("%s token probe ok · plan=%s", tag, workspace.JWTPlanType(at))
+					} else {
+						acc["token_status"] = "dead"
+						opt.log("%s token probe FAIL · %v", tag, pe)
+						// Recover: RT refresh → re-elevate with ST → probe again.
+						if reg.RefreshToken != "" {
+							if newAT, newRT, e := workspace.RefreshTokens(reg.RefreshToken, proxy); e == nil && newAT != "" {
+								at = newAT
+								reg.AccessToken = newAT
+								acc["access_token"] = newAT
+								if newRT != "" {
+									reg.RefreshToken = newRT
+									acc["refresh_token"] = newRT
+								}
+								opt.log("%s recovered AT via RT refresh", tag)
+							} else if e != nil {
+								opt.log("%s RT refresh: %v", tag, e)
+							}
+						}
+						if st != "" && len(preferred) > 0 {
+							if fields, e := workspace.ElevateSession(st, preferred, proxy); e == nil && fields.AccessToken != "" {
+								at = fields.AccessToken
+								reg.AccessToken = fields.AccessToken
+								acc["access_token"] = fields.AccessToken
+								if fields.SessionToken != "" {
+									st = fields.SessionToken
+									reg.SessionToken = fields.SessionToken
+									acc["session_token"] = fields.SessionToken
+								}
+								if fields.ChatGPTAccountID != "" {
+									acc["chatgpt_account_id"] = fields.ChatGPTAccountID
+									aidHint = fields.ChatGPTAccountID
+								}
+								if workspace.JWTIsWorkspaceScoped(at) {
+									elevatedOK = true
+									acc["elevate_status"] = "ok"
+									acc["workspace_scope"] = "elevated"
+									acc["plan_type"] = workspace.JWTPlanType(at)
+									opt.log("%s re-elevate after probe · plan=%s", tag, acc["plan_type"])
+								}
+							} else if e != nil {
+								opt.log("%s re-elevate: %v", tag, e)
+							}
+						}
+						if pe2 := workspace.ProbeAccessToken(at, aidHint, proxy); pe2 == nil {
+							tokenLive = true
+							acc["token_status"] = "live"
+							opt.log("%s token probe ok after recover", tag)
+						} else {
+							acc["token_status"] = "invalidated"
+							elevatedOK = false
+							opt.log("%s token still dead after recover · %v · skip import", tag, pe2)
+						}
+					}
+				}
+
 				// Check API: membership metadata only. Do NOT treat as k12 success
-				// unless JWT is workspace-scoped.
+				// unless JWT is workspace-scoped AND token is live.
 				if plan, aid, err := workspace.CheckPlan(at, proxy, preferred); err == nil {
 					if aid != "" {
 						acc["chatgpt_account_id"] = aid
@@ -358,24 +437,108 @@ func Run(opt Options) (stats Stats, err error) {
 							acc["workspace_scope"] = "check_pending"
 						}
 					}
-					opt.log("%s plan=%s check=%s jwt=%s account=%s",
-						tag, str(acc["plan_type"]), plan, jwtOrFree(jwtPlan, jwtScoped), trunc(aid, 12))
-					if elevatedOK || jwtScoped {
+					opt.log("%s plan=%s check=%s jwt=%s live=%v account=%s",
+						tag, str(acc["plan_type"]), plan, jwtOrFree(jwtPlan, jwtScoped), tokenLive, trunc(aid, 12))
+					if tokenLive && (elevatedOK || jwtScoped) {
 						atomic.AddInt64(&stats.K12, 1)
 					}
 				} else {
 					opt.log("%s plan check: %v", tag, err)
-					// Elevate already proved k12 via JWT.
-					if elevatedOK || workspace.JWTIsWorkspaceScoped(at) {
+					if workspace.IsTokenInvalidated(err) {
+						tokenLive = false
+						acc["token_status"] = "invalidated"
+						elevatedOK = false
+					}
+					// Only count k12 when JWT scoped AND live probe passed.
+					if tokenLive && (elevatedOK || workspace.JWTIsWorkspaceScoped(at)) {
 						atomic.AddInt64(&stats.K12, 1)
+					}
+				}
+				// Stash for import gate below (same worker scope).
+				acc["_token_live"] = tokenLive
+			}
+
+			// No-workspace (or join skipped): still probe AT before import/write.
+			if _, hasLive := acc["_token_live"]; !hasLive && reg.AccessToken != "" {
+				aidHint := str(acc["chatgpt_account_id"])
+				if pe := workspace.ProbeAccessToken(reg.AccessToken, aidHint, proxy); pe == nil {
+					acc["_token_live"] = true
+					acc["token_status"] = "live"
+					opt.log("%s token probe ok", tag)
+				} else {
+					opt.log("%s token probe FAIL · %v", tag, pe)
+					if reg.RefreshToken != "" {
+						if newAT, newRT, e := workspace.RefreshTokens(reg.RefreshToken, proxy); e == nil && newAT != "" {
+							reg.AccessToken = newAT
+							acc["access_token"] = newAT
+							if newRT != "" {
+								reg.RefreshToken = newRT
+								acc["refresh_token"] = newRT
+							}
+							if pe2 := workspace.ProbeAccessToken(reg.AccessToken, aidHint, proxy); pe2 == nil {
+								acc["_token_live"] = true
+								acc["token_status"] = "live"
+								opt.log("%s token probe ok after RT refresh", tag)
+							} else {
+								acc["_token_live"] = false
+								acc["token_status"] = "invalidated"
+								opt.log("%s token still dead · %v", tag, pe2)
+							}
+						} else {
+							acc["_token_live"] = false
+							acc["token_status"] = "invalidated"
+						}
+					} else {
+						acc["_token_live"] = false
+						acc["token_status"] = "invalidated"
 					}
 				}
 			}
 
-			// Optional import to one or more account pools.
-			// Gate on JWT workspace scope when require_k12 — check-API plan alone is insufficient.
+			// tokenLive for AT write / import gates.
+			tokenLive := true
+			if v, ok := acc["_token_live"].(bool); ok {
+				tokenLive = v
+				delete(acc, "_token_live")
+			}
+
+			// Prefer writing token when JWT is real k12 (or always if no workspace).
+			// Never write dead/invalidated tokens into access_token.txt for Codex use.
+			writeTok := reg.AccessToken
+			if v, ok := acc["token_status"].(string); ok && (v == "dead" || v == "invalidated") {
+				writeTok = ""
+			}
+			if !tokenLive {
+				writeTok = ""
+			}
+			if cfg.WorkspaceEnabled && cfg.ImportRequireK12 {
+				if !workspace.JWTIsWorkspaceScoped(writeTok) && !isK12(str(acc["plan_type"])) {
+					writeTok = "" // still saved in JSON; skip free AT line
+				}
+				// Stricter: if we require k12 for import, only write JWT-scoped tokens.
+				if !workspace.JWTIsWorkspaceScoped(reg.AccessToken) {
+					writeTok = ""
+				}
+			}
+
 			importEps := cfg.ActiveImportEndpoints()
-			if len(importEps) > 0 && reg.AccessToken != "" {
+			needAgent := cfg.CodexAgentEnabled || hasAgentIdentityEndpoint(importEps)
+			var agentAuth *codexagent.AuthJSON
+			// Register Codex Agent Identity when enabled or any import endpoint needs it.
+			if writeTok != "" && needAgent {
+				auth, err := registerCodexAgent(cfg, writeTok, proxy, acc, tag, opt.log)
+				if err != nil {
+					opt.log("%s codex agent: %v", tag, err)
+					acc["codex_agent_status"] = "failed"
+				} else {
+					agentAuth = auth
+				}
+			}
+
+			// Optional import to one or more account pools.
+			// Mode "at": push access_token (live JWT, optional k12 gate).
+			// Mode "agent_identity": push auth.json to codex2api (AGENT_IDENTITY_IMPORT.md).
+			if len(importEps) > 0 {
 				plan := strings.ToLower(str(acc["plan_type"]))
 				jwtOK := workspace.JWTIsWorkspaceScoped(reg.AccessToken)
 				var results []map[string]any
@@ -385,29 +548,96 @@ func Run(opt Options) (stats Stats, err error) {
 					if label == "" {
 						label = ep.URL
 					}
+					mode := importapi.NormalizeMode(ep.Mode)
 					reqK12 := ep.RequireK12
-					// Must have real JWT workspace claims — check-API plan alone is not enough.
+
+					if mode == importapi.ModeAgentIdentity {
+						if agentAuth == nil {
+							skipN++
+							results = append(results, map[string]any{
+								"name": label, "url": ep.URL, "mode": mode, "status": "skipped",
+								"reason": "no_agent_auth",
+							})
+							opt.log("%s import skip · %s · agent_identity · no auth.json", tag, label)
+							continue
+						}
+						if reqK12 && !jwtOK {
+							skipN++
+							results = append(results, map[string]any{
+								"name": label, "url": ep.URL, "mode": mode, "status": "skipped",
+								"reason": "jwt_not_k12 plan=" + plan,
+							})
+							opt.log("%s import skip · %s · agent_identity · JWT not k12 plan=%s", tag, label, plan)
+							continue
+						}
+						// Admin API direct (no reg proxy). Optional ep.ProxyURL is gateway-side proxy for the account.
+						name := str(acc["email"])
+						if name == "" {
+							name = agentAuth.AgentIdentity.Email
+						}
+						ir := importapi.PushAgentIdentity(ep.URL, ep.AdminKey, agentAuth, name, ep.ProxyURL, "")
+						if !ir.OK && isImportNetErr(ir.Error) {
+							if err := sleepCtx(ctx, 800*time.Millisecond); err != nil {
+								return
+							}
+							ir = importapi.PushAgentIdentity(ep.URL, ep.AdminKey, agentAuth, name, ep.ProxyURL, "")
+						}
+						entry := map[string]any{
+							"name": label, "url": ep.URL, "mode": mode, "status": ir.Outcome, "ok": ir.OK,
+						}
+						if ir.Error != "" {
+							entry["error"] = ir.Error
+						}
+						if ir.Email != "" {
+							entry["email"] = ir.Email
+						}
+						results = append(results, entry)
+						if ir.OK {
+							okN++
+							opt.log("%s import ok · %s · agent_identity · %s", tag, label, ir.Outcome)
+						} else {
+							failN++
+							opt.log("%s import fail · %s · agent_identity · %s", tag, label, ir.Error)
+						}
+						continue
+					}
+
+					// Mode AT (legacy)
+					if reg.AccessToken == "" {
+						skipN++
+						results = append(results, map[string]any{
+							"name": label, "url": ep.URL, "mode": mode, "status": "skipped",
+							"reason": "no_access_token",
+						})
+						continue
+					}
+					if !tokenLive {
+						skipN++
+						results = append(results, map[string]any{
+							"name": label, "url": ep.URL, "mode": mode, "status": "skipped",
+							"reason": "token_invalidated",
+						})
+						opt.log("%s import skip · %s · at · token not live", tag, label)
+						continue
+					}
 					if reqK12 && !jwtOK {
 						skipN++
 						results = append(results, map[string]any{
-							"name": label, "url": ep.URL, "status": "skipped",
+							"name": label, "url": ep.URL, "mode": mode, "status": "skipped",
 							"reason": "jwt_not_k12 plan=" + plan,
 						})
-						opt.log("%s import skip · %s · JWT not workspace-scoped plan=%s", tag, label, plan)
+						opt.log("%s import skip · %s · at · JWT not workspace-scoped plan=%s", tag, label, plan)
 						continue
 					}
-					// Import to own account-pool APIs should go direct (no reg proxy).
-					// Residential SOCKS often RST/EOF when tunneling to arbitrary hosts.
 					ir := importapi.Push(ep.URL, ep.AdminKey, reg.AccessToken, "")
 					if !ir.OK && isImportNetErr(ir.Error) {
-						// One retry after brief backoff (API/proxy blips).
 						if err := sleepCtx(ctx, 800*time.Millisecond); err != nil {
 							return
 						}
 						ir = importapi.Push(ep.URL, ep.AdminKey, reg.AccessToken, "")
 					}
 					entry := map[string]any{
-						"name": label, "url": ep.URL, "status": ir.Outcome, "ok": ir.OK,
+						"name": label, "url": ep.URL, "mode": mode, "status": ir.Outcome, "ok": ir.OK,
 					}
 					if ir.Error != "" {
 						entry["error"] = ir.Error
@@ -415,10 +645,10 @@ func Run(opt Options) (stats Stats, err error) {
 					results = append(results, entry)
 					if ir.OK {
 						okN++
-						opt.log("%s import ok · %s · %s", tag, label, ir.Outcome)
+						opt.log("%s import ok · %s · at · %s", tag, label, ir.Outcome)
 					} else {
 						failN++
-						opt.log("%s import fail · %s · %s", tag, label, ir.Error)
+						opt.log("%s import fail · %s · at · %s", tag, label, ir.Error)
 					}
 				}
 				acc["import_results"] = results
@@ -440,17 +670,6 @@ func Run(opt Options) (stats Stats, err error) {
 
 			if err := storage.AppendAccount(accountsPath, acc); err != nil {
 				opt.log("%s save accounts: %v", tag, err)
-			}
-			// Prefer writing token when JWT is real k12 (or always if no workspace).
-			writeTok := reg.AccessToken
-			if cfg.WorkspaceEnabled && cfg.ImportRequireK12 {
-				if !workspace.JWTIsWorkspaceScoped(writeTok) && !isK12(str(acc["plan_type"])) {
-					writeTok = "" // still saved in JSON; skip free AT line
-				}
-				// Stricter: if we require k12 for import, only write JWT-scoped tokens.
-				if !workspace.JWTIsWorkspaceScoped(reg.AccessToken) {
-					writeTok = ""
-				}
 			}
 			if writeTok != "" {
 				if err := storage.AppendAccessToken(tokenPath, writeTok); err != nil {
@@ -578,6 +797,11 @@ func isRetryableRegister(err error) bool {
 		// Identity permanently unusable — proxy rotate will not help.
 		"deleted or deactivated", "has been deleted", "has been deactivated",
 		"you do not have an account because", "account is deactivated",
+		// create_account already succeeded server-side; full re-auth soft-retry
+		// turns "verification" into "login" + invalid_state / deactivated.
+		"redeem_after_create",
+		"token_exchange_user_error",
+		"chatgpt_web missing access_token",
 	}
 	for _, k := range hard {
 		if strings.Contains(s, k) {
@@ -618,6 +842,52 @@ func isRetryableRegister(err error) bool {
 func isK12(plan string) bool {
 	p := strings.ToLower(strings.TrimSpace(plan))
 	return p == "k12" || p == "team" || p == "enterprise" || p == "edu" || p == "business"
+}
+
+func hasAgentIdentityEndpoint(eps []config.ImportEndpoint) bool {
+	for _, ep := range eps {
+		if importapi.NormalizeMode(ep.Mode) == importapi.ModeAgentIdentity {
+			return true
+		}
+	}
+	return false
+}
+
+// registerCodexAgent creates Codex CLI agent_identity auth.json under data/codex_auth/.
+func registerCodexAgent(cfg config.Config, accessToken, proxy string, acc map[string]any, tag string, logf func(string, ...any)) (*codexagent.AuthJSON, error) {
+	auth, err := codexagent.Create(codexagent.Options{
+		AccessToken: accessToken,
+		Proxy:       proxy,
+		VerifyTask:  cfg.CodexAgentVerifyTask,
+	})
+	if err != nil {
+		return nil, err
+	}
+	outDir := strings.TrimSpace(cfg.CodexAgentOutputDir)
+	if outDir == "" {
+		outDir = "codex_auth"
+	}
+	dir := cfg.ResolvePath(outDir)
+	email := auth.AgentIdentity.Email
+	if email == "" {
+		email = str(acc["email"])
+	}
+	base := codexagent.SafeFilename(email)
+	if base == "" || base == "unknown" {
+		base = codexagent.SafeFilename(auth.AgentIdentity.AccountID)
+	}
+	path := filepath.Join(dir, base+".json")
+	if err := codexagent.WriteAuthJSON(path, auth); err != nil {
+		return nil, err
+	}
+	_ = codexagent.AppendAuthJSONL(filepath.Join(dir, "agents.jsonl"), auth)
+	acc["codex_agent_status"] = "ok"
+	acc["agent_runtime_id"] = auth.AgentIdentity.AgentRuntimeID
+	acc["codex_auth_file"] = filepath.ToSlash(filepath.Join(outDir, base+".json"))
+	if logf != nil {
+		logf("%s codex agent ok · runtime=%s · %s", tag, trunc(auth.AgentIdentity.AgentRuntimeID, 24), path)
+	}
+	return auth, nil
 }
 
 func jwtOrFree(jwtPlan string, scoped bool) string {

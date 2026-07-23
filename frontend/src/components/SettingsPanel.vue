@@ -200,6 +200,10 @@ async function loadSettings() {
     // UI only exposes ChatGPT Web protocol path.
     s.registration.oauth_path = 'chatgpt_web'
     s.import_api = normalizeImportApi(s.import_api)
+    for (const ep of s.import_api.endpoints) {
+      if (!ep.mode) ep.mode = 'at'
+      if (ep.proxy_url == null) ep.proxy_url = ''
+    }
     if (!s.mail) s.mail = { mailboxes_file: '', alias_count: 1, wait_timeout: 30, wait_interval: 1.5 }
     if (!s.mail.alias_count || s.mail.alias_count < 1) s.mail.alias_count = 1
     if (s.mail.alias_count > 50) s.mail.alias_count = 50
@@ -207,6 +211,10 @@ async function loadSettings() {
     if (s.mail.wait_timeout > 300) s.mail.wait_timeout = 300
     if (!s.mail.wait_interval || s.mail.wait_interval < 0.3) s.mail.wait_interval = 1.5
     if (s.mail.wait_interval > 30) s.mail.wait_interval = 30
+    if (!s.codex_agent) {
+      s.codex_agent = { enabled: false, verify_task: true, output_dir: 'codex_auth' }
+    }
+    if (!s.codex_agent.output_dir) s.codex_agent.output_dir = 'codex_auth'
     s.workspace = normalizeWorkspace(s.workspace)
     settings.value = s
     // 解析每个母号 session
@@ -309,6 +317,29 @@ onMounted(loadSettings)
               <option value="full_success">full_success</option>
             </select>
           </div>
+        </div>
+        <div class="border-t pt-3 space-y-2" style="border-color: var(--app-border-soft)">
+          <div class="flex items-center justify-between gap-2">
+            <div>
+              <div class="text-[13px] font-medium ui-heading">Codex Agent Identity</div>
+              <p class="hint mt-0.5 leading-relaxed">
+                出号成功后自动注册 agent →
+                <span class="font-mono text-[10px]">data/{{ settings.codex_agent.output_dir }}/</span>
+              </p>
+            </div>
+            <label class="toggle" title="流水线自动注册 Codex Agent">
+              <input v-model="settings.codex_agent.enabled" type="checkbox" />
+              <span class="toggle-track"><span class="toggle-thumb" /></span>
+            </label>
+          </div>
+          <label class="flex cursor-pointer items-center gap-2 text-xs text-slate-400">
+            <input
+              v-model="settings.codex_agent.verify_task"
+              type="checkbox"
+              class="h-3.5 w-3.5 rounded accent-blue-500"
+            />
+            注册后验证 task 签名（推荐）
+          </label>
         </div>
       </div>
 
@@ -669,22 +700,33 @@ onMounted(loadSettings)
             <h3 class="card-title">导入 API</h3>
             <p class="hint">
               已启用 <span class="text-slate-300">{{ enabledImportCount }}</span> /
-              {{ settings.import_api.endpoints.length }} · 成功账号会推送到全部启用端点
+              {{ settings.import_api.endpoints.length }} · 成功账号推送到启用端点
             </p>
           </div>
         </div>
         <button type="button" class="btn btn-ghost btn-sm ml-auto" @click="addImportEndpoint">+ 添加</button>
       </div>
 
+      <p class="mb-2 text-[11px] leading-relaxed ui-faint">
+        模式
+        <span class="font-mono text-[10px]">agent_identity</span>
+        → codex2api
+        <span class="font-mono text-[10px]">/api/admin/accounts/codex/agent-identity</span>
+        （auth.json，不存 AT）；
+        <span class="font-mono text-[10px]">at</span>
+        → 旧版 access_token 导入。
+      </p>
+
       <!-- Desktop header -->
       <div
-        class="mb-1.5 hidden grid-cols-[auto_7rem_1fr_10rem_auto_auto] items-center gap-2 px-2 text-[10px] font-semibold uppercase tracking-wider text-slate-600 lg:grid"
+        class="mb-1.5 hidden grid-cols-[auto_6rem_1fr_8rem_7rem_auto_auto] items-center gap-2 px-2 text-[10px] font-semibold uppercase tracking-wider text-slate-600 lg:grid"
       >
         <span class="w-10 text-center">开</span>
         <span>名称</span>
         <span>URL</span>
         <span>admin_key</span>
-        <span class="w-16 text-center">k12</span>
+        <span>模式</span>
+        <span class="w-14 text-center">k12</span>
         <span class="w-12" />
       </div>
 
@@ -696,7 +738,7 @@ onMounted(loadSettings)
           :class="ep.enabled ? 'opacity-100' : 'opacity-55'"
         >
           <!-- Desktop row -->
-          <div class="hidden items-center gap-2 lg:grid lg:grid-cols-[auto_7rem_1fr_10rem_auto_auto]">
+          <div class="hidden items-center gap-2 lg:grid lg:grid-cols-[auto_6rem_1fr_8rem_7rem_auto_auto]">
             <label class="toggle mx-1" :title="ep.enabled ? '启用' : '禁用'">
               <input v-model="ep.enabled" type="checkbox" />
               <span class="toggle-track"><span class="toggle-thumb" /></span>
@@ -712,7 +754,15 @@ onMounted(loadSettings)
               class="field !rounded-lg !px-2 !py-1.5 font-mono text-xs"
               placeholder="密钥"
             />
-            <label class="flex w-16 cursor-pointer items-center justify-center gap-1 text-xs text-slate-400">
+            <select
+              v-model="ep.mode"
+              class="field !rounded-lg !py-1.5 !pl-2 !pr-8 text-xs"
+              title="导入模式"
+            >
+              <option value="agent_identity">Agent ID</option>
+              <option value="at">access_token</option>
+            </select>
+            <label class="flex w-14 cursor-pointer items-center justify-center gap-1 text-xs text-slate-400">
               <input v-model="ep.require_k12" type="checkbox" class="h-3.5 w-3.5 rounded accent-blue-500" />
               k12
             </label>
@@ -724,6 +774,16 @@ onMounted(loadSettings)
             >
               ✕
             </button>
+          </div>
+          <div
+            v-if="ep.mode === 'agent_identity'"
+            class="mt-1.5 hidden lg:block"
+          >
+            <input
+              v-model="ep.proxy_url"
+              class="field w-full !rounded-lg !px-2 !py-1 font-mono text-[11px]"
+              placeholder="可选 proxy_url（写入网关账号，如 http://user:pass@host:port）"
+            />
           </div>
 
           <!-- Mobile stacked -->
@@ -747,17 +807,27 @@ onMounted(loadSettings)
               class="field w-full !py-1.5 font-mono text-xs"
               placeholder="URL http://host:port"
             />
-            <div class="flex gap-2">
+            <div class="flex flex-wrap gap-2">
               <input
                 v-model="ep.admin_key"
                 class="field min-w-0 flex-1 !py-1.5 font-mono text-xs"
                 placeholder="admin_key"
               />
+              <select v-model="ep.mode" class="field !w-auto min-w-[7.5rem] !py-1.5 !pl-2 !pr-8 text-xs">
+                <option value="agent_identity">Agent ID</option>
+                <option value="at">access_token</option>
+              </select>
               <label class="flex shrink-0 items-center gap-1.5 text-xs text-slate-400">
                 <input v-model="ep.require_k12" type="checkbox" class="h-3.5 w-3.5 rounded accent-blue-500" />
                 仅 k12
               </label>
             </div>
+            <input
+              v-if="ep.mode === 'agent_identity'"
+              v-model="ep.proxy_url"
+              class="field w-full !py-1.5 font-mono text-[11px]"
+              placeholder="可选 proxy_url"
+            />
           </div>
         </div>
       </div>

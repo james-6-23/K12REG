@@ -162,8 +162,10 @@ func runChatGPTWeb(opt Options) (*Result, error) {
 	}
 	// Boundary slightly before authorize: login_hint often auto-sends OTP on authorize.
 	otpBoundary := time.Now().UTC().Add(-5 * time.Second)
-	if err := chatgptAuthorize(client, email, deviceID, challenge); err != nil {
+	if src, err := chatgptAuthorize(client, email, deviceID, challenge); err != nil {
 		return nil, err
+	} else {
+		logf(opt, "authorize · src=%s", src)
 	}
 	// Land on verification page so auth-session cookies stick (do NOT re-send OTP yet —
 	// a second send can invalidate the authorize session → validate 409 invalid_state).
@@ -186,8 +188,17 @@ func runChatGPTWeb(opt Options) (*Result, error) {
 		if isInvalidAuthState(err) {
 			logf(opt, "validate 409 invalid_state · re-authorize once")
 			otpBoundary = time.Now().UTC().Add(-3 * time.Second)
-			if e2 := chatgptAuthorize(client, email, deviceID, challenge); e2 != nil {
+			// Fresh PKCE pair on re-auth — old authorize session is dead; rebind
+			// outer verifier/challenge so later oauth/token matches this authorize.
+			v2, c2, ePKCE := pkce.Generate()
+			if ePKCE != nil {
+				return nil, fmt.Errorf("%w (re-auth pkce: %v)", err, ePKCE)
+			}
+			verifier, challenge = v2, c2
+			if src, e2 := chatgptAuthorize(client, email, deviceID, challenge); e2 != nil {
 				return nil, fmt.Errorf("%w (re-auth: %v)", err, e2)
+			} else {
+				logf(opt, "re-authorize · src=%s", src)
 			}
 			_, _ = client.Get(AuthBase+"/email-verification", navigateHeaders(AuthBase+"/"), true)
 			if e2 := sendOTP(client); e2 != nil {
@@ -235,45 +246,57 @@ func runChatGPTWeb(opt Options) (*Result, error) {
 	if err := opt.errIfDone(); err != nil {
 		return nil, err
 	}
-	// NextAuth callback → session cookie + accessToken (required for later k12 elevate).
-	logf(opt, "redeem session via chatgpt callback")
-	tokens, err := redeemViaSession(client, continueURL)
+	// Redeem strategy for chatgpt_web (field-proven):
+	//
+	// NextAuth signup codes must be finished via browser continue_url →
+	// /api/auth/session. Public oauth/token with app_X8z + PKCE returns
+	// token_exchange_user_error even when code_verifier matches — so we do
+	// NOT rely on oauth for this path. RT is typically absent (session redeem
+	// never yields refresh_token). ST cookie is required for k12 elevate.
+	//
+	// Order: session callback first → SSO bootstrap if needed.
+	// (authCode / verifier kept for diagnostics / future RT experiments.)
+	_ = authCode
+	_ = verifier
+	tokens := map[string]string{}
+	logf(opt, "session redeem · continue_url callback (web client)")
+	sessTok, err := redeemViaSession(client, continueURL)
 	if err != nil {
-		logf(opt, "session redeem fail · %v · try oauth/token + bootstrap", err)
-		tokens, err = exchangeTokens(client, verifier, authCode, ClientID, RedirectURI, ChatGPTBase)
-		if err != nil {
-			return nil, err
-		}
-		if tokens["session_token"] == "" {
-			if st, bootErr := bootstrapSessionToken(client); bootErr == nil && st != "" {
-				tokens["session_token"] = st
-				logf(opt, "session bootstrap ok · ST=yes")
-				// Prefer Web session AT if pullable (better for elevate than bare oauth AT).
-				if sess, e := pullSessionJSON(client); e == nil && sess["access_token"] != "" {
-					tokens["access_token"] = sess["access_token"]
-					if sess["session_token"] != "" {
-						tokens["session_token"] = sess["session_token"]
-					}
-					logf(opt, "session AT after bootstrap ok")
-				}
-			} else if bootErr != nil {
-				logf(opt, "session bootstrap skip · %v", bootErr)
-			}
-		}
-	} else if tokens["session_token"] == "" {
-		logf(opt, "session redeem ok but ST empty · try bootstrap")
+		logf(opt, "session callback fail · %v · try SSO bootstrap", err)
 		if st, bootErr := bootstrapSessionToken(client); bootErr == nil && st != "" {
 			tokens["session_token"] = st
-			logf(opt, "session bootstrap ok · ST=yes")
+			if sess, e2 := pullSessionJSON(client); e2 == nil {
+				for _, k := range []string{"access_token", "session_token", "id_token"} {
+					if sess[k] != "" {
+						tokens[k] = sess[k]
+					}
+				}
+			}
+			if tokens["access_token"] == "" {
+				// Hard fail: account may already exist server-side — do not soft-retry full signup.
+				return nil, fmt.Errorf("redeem_after_create: session %v; bootstrap empty AT", err)
+			}
+			logf(opt, "session bootstrap ok · AT=yes")
+		} else {
+			return nil, fmt.Errorf("redeem_after_create: session %w", err)
+		}
+	} else {
+		tokens = sessTok
+		logf(opt, "session callback ok · ST=%v AT=%v", tokens["session_token"] != "", tokens["access_token"] != "")
+	}
+	if tokens["session_token"] == "" {
+		if st, bootErr := bootstrapSessionToken(client); bootErr == nil && st != "" {
+			tokens["session_token"] = st
+			logf(opt, "session bootstrap (final) ok · ST=yes")
 		} else {
 			logf(opt, "session ST empty · elevate may fail")
 		}
-	} else {
-		logf(opt, "session redeem ok · ST=yes AT=%v", tokens["access_token"] != "")
 	}
+	logf(opt, "redeem done · ST=%v AT=%v RT=%v",
+		tokens["session_token"] != "", tokens["access_token"] != "", tokens["refresh_token"] != "")
 
 	if tokens["access_token"] == "" {
-		return nil, fmt.Errorf("chatgpt_web missing access_token after redeem")
+		return nil, fmt.Errorf("redeem_after_create: chatgpt_web missing access_token after redeem")
 	}
 
 	return &Result{
@@ -609,18 +632,26 @@ func bootstrapSessionToken(client *httpx.Client) (string, error) {
 }
 
 // chatgptAuthorize mirrors chatgpt.com NextAuth sign-in → authorize (browser order).
-// Falls back to a direct authorize hit if signin bootstrap fails.
-func chatgptAuthorize(client *httpx.Client, email, deviceID, challenge string) error {
-	// Browser-ish warm-up: home → providers → csrf → signin/openai → authorize.
+//
+// Prefer NextAuth /api/auth/signin/openai authorize URL so continue_url session
+// redeem works (csrf/state cookies). Do NOT inject our PKCE into that URL — it
+// breaks both oauth/token and NextAuth callback (reg=0 field failure).
+//
+// challenge is unused on the NextAuth path (session redeem, not public PKCE
+// exchange). Kept in the signature for call-site compatibility / re-auth.
+//
+// Returns authorize source label ("nextauth" | "built") for logs.
+func chatgptAuthorize(client *httpx.Client, email, deviceID, challenge string) (pkceSrc string, err error) {
+	_ = challenge
 	nav := navigateHeaders("")
 	_, _ = client.Get(ChatGPTBase+"/", nav, true)
 	apiH := map[string]string{
-		"accept":          "application/json",
-		"accept-language": "en-US,en;q=0.9",
-		"referer":         ChatGPTBase + "/",
-		"user-agent":      httpx.UserAgent,
-		"sec-ch-ua":       httpx.SecChUA,
-		"sec-ch-ua-mobile": "?0",
+		"accept":             "application/json",
+		"accept-language":    "en-US,en;q=0.9",
+		"referer":            ChatGPTBase + "/",
+		"user-agent":         httpx.UserAgent,
+		"sec-ch-ua":          httpx.SecChUA,
+		"sec-ch-ua-mobile":   "?0",
 		"sec-ch-ua-platform": `"Windows"`,
 	}
 	_, _ = client.Get(ChatGPTBase+"/api/auth/providers", apiH, false)
@@ -632,7 +663,7 @@ func chatgptAuthorize(client *httpx.Client, email, deviceID, challenge string) e
 		csrf, _ = body["csrfToken"].(string)
 	}
 
-	authURL := ""
+	nextAuthURL := ""
 	authSessionLogID := randomUUID()
 	if csrf != "" {
 		q := url.Values{}
@@ -640,8 +671,8 @@ func chatgptAuthorize(client *httpx.Client, email, deviceID, challenge string) e
 		q.Set("ext-passkey-client-capabilities", "01111")
 		q.Set("ext-oai-did", deviceID)
 		q.Set("auth_session_logging_id", authSessionLogID)
-		// Prefer signup: login_or_signup often routes deleted identities into a
-		// login OTP path that ends in validate 403 "deleted or deactivated".
+		// Prefer signup: without this, deleted identities get "login code" →
+		// validate 403 account_deactivated.
 		q.Set("screen_hint", "signup")
 		q.Set("login_hint", email)
 		form := url.Values{}
@@ -666,26 +697,80 @@ func chatgptAuthorize(client *httpx.Client, email, deviceID, challenge string) e
 		if err == nil && resp.StatusCode == 200 {
 			var body map[string]any
 			_ = json.Unmarshal(resp.Body, &body)
-			authURL, _ = body["url"].(string)
+			nextAuthURL, _ = body["url"].(string)
 		}
 	}
 
-	if authURL == "" {
-		// Direct authorize (Web client + full scopes). PKCE kept for oauth/token fallback.
-		authURL = buildAuthorizeURL(email, deviceID, challenge, true)
-	}
+	authURL, pkceSrc := resolveAuthorizeURL(nextAuthURL, email, deviceID)
 
 	headers := navigateHeaders(ChatGPTBase + "/")
 	headers["sec-fetch-site"] = "cross-site"
 	resp, err := client.Get(authURL, headers, true)
 	if err != nil {
-		return err
+		return pkceSrc, err
 	}
-	// 200 landing on email-verification / create-account is OK.
 	if resp.StatusCode != 200 && resp.StatusCode != 302 && resp.StatusCode != 303 {
-		return fmt.Errorf("chatgpt_authorize HTTP %d: %s", resp.StatusCode, httpx.DumpSnippet(resp.Body, 300))
+		return pkceSrc, fmt.Errorf("chatgpt_authorize HTTP %d: %s", resp.StatusCode, httpx.DumpSnippet(resp.Body, 300))
 	}
-	return nil
+	return pkceSrc, nil
+}
+
+// resolveAuthorizeURL prefers NextAuth's authorize URL (session cookies).
+// Fallback is a direct Web authorize without client-side PKCE.
+func resolveAuthorizeURL(nextAuthURL, email, deviceID string) (string, string) {
+	if strings.TrimSpace(nextAuthURL) != "" {
+		return nextAuthURL, "nextauth"
+	}
+	return buildAuthorizeURL(email, deviceID, "", false), "built"
+}
+
+// forcePKCEAuthorizeURL is deprecated for production chatgpt_web (oauth/token
+// does not accept Web signup codes). Kept for tests that assert "do not inject".
+func forcePKCEAuthorizeURL(nextAuthURL, email, deviceID, challenge string) (string, string) {
+	// Production resolve path ignores challenge; this helper documents that
+	// even when a challenge is supplied we must not patch NextAuth URLs.
+	_ = challenge
+	return resolveAuthorizeURL(nextAuthURL, email, deviceID)
+}
+
+// injectAuthorizePKCE is retained for unit tests / diagnostics only.
+// Production authorize path never uses it (see forcePKCEAuthorizeURL).
+func injectAuthorizePKCE(raw, challenge string) string {
+	raw = strings.TrimSpace(raw)
+	if raw == "" || challenge == "" {
+		return ""
+	}
+	u, err := url.Parse(raw)
+	if err != nil || u.Scheme == "" || u.Host == "" {
+		return ""
+	}
+	path := strings.ToLower(u.Path)
+	if !strings.Contains(path, "authorize") {
+		return ""
+	}
+	q := u.Query()
+	q.Set("code_challenge", challenge)
+	q.Set("code_challenge_method", "S256")
+	if q.Get("response_mode") == "" {
+		q.Set("response_mode", "query")
+	}
+	if q.Get("auth0Client") == "" {
+		q.Set("auth0Client", Auth0Client)
+	}
+	scope := q.Get("scope")
+	if scope == "" {
+		q.Set("scope", Scope)
+	} else if !strings.Contains(strings.ToLower(scope), "offline_access") {
+		q.Set("scope", strings.TrimSpace(scope+" offline_access"))
+	}
+	if q.Get("client_id") == "" {
+		q.Set("client_id", ClientID)
+	}
+	if q.Get("redirect_uri") == "" {
+		q.Set("redirect_uri", RedirectURI)
+	}
+	u.RawQuery = q.Encode()
+	return u.String()
 }
 
 func buildAuthorizeURL(email, deviceID, challenge string, withPKCE bool) string {
